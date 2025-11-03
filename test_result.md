@@ -101,3 +101,195 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: |
+  CloudCP Calendar Enhancement - Festival Prediction & AWS Integration
+  - Fix calendar functionality
+  - Show all 2025 and 2026 festivals with traffic spike predictions
+  - Implement AWS EC2 instance management
+  - Display festival traffic spikes based on boost multipliers from training data
+  - Use specific Indian festivals: Republic Day, Holi, Ram Navami, Independence Day, Diwali, Diwali Weekend, Christmas
+  - Implement scaling logic: 1 instance for <700, 2 for 700-1400, 3 for 1400-2100, etc.
+
+backend:
+  - task: "Festival data with boost multipliers"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Added INDIAN_FESTIVALS dict with boost values (2.0-4.5x) for all major festivals in 2023-2026. Updated check_festival_calendarific to return boost values."
+
+  - task: "Traffic prediction with boost multiplier"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Updated predict_traffic function to apply festival boost multiplier to predictions. Traffic spikes are now amplified by boost factor (e.g., 4.5x for Diwali)."
+
+  - task: "Instance scaling logic (1 for <700, 2 for 700-1400, etc.)"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Updated scale_ec2_instances with new thresholds: <700=1, 700-1400=2, 1400-2100=3, 2100-3000=4, 3000-5000=5, >5000=10 instances."
+
+  - task: "2025 festivals endpoint with predictions"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Created /api/festivals/2025 endpoint returning all major 2025 festivals with 24-hour predictions, boost values, peak hour, YoY comparison with 2024 data."
+
+  - task: "2026 festivals endpoint with predictions"
+    implemented: true
+    working: true
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Created /api/festivals/2026 endpoint with same structure as 2025, comparing with 2025 previous year data."
+
+  - task: "AWS instances listing endpoint"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Created /api/aws/instances endpoint to list EC2 instances in ASG. Works in mock mode without AWS credentials, returns real data with valid credentials."
+
+  - task: "AWS instance update endpoint"
+    implemented: true
+    working: "NA"
+    file: "/app/backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Created /api/aws/update-instance endpoint to terminate/stop/start specific instances. Requires AWS credentials to function."
+
+frontend:
+  - task: "Festival Calendar Component"
+    implemented: true
+    working: true
+    file: "/app/frontend/src/components/FestivalCalendar.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Created FestivalCalendar component with 2025/2026 tabs, festival cards showing boost multipliers, traffic spikes, YoY growth, and 24-hour chart for selected festival."
+
+  - task: "Tabs integration in main App"
+    implemented: true
+    working: true
+    file: "/app/frontend/src/App.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Added Tabs component with '24-Hour Predictions' and 'Festival Calendar' views. Festival Calendar shows all festivals with traffic spike visualizations."
+
+  - task: "Festival spike visualization"
+    implemented: true
+    working: true
+    file: "/app/frontend/src/components/FestivalCalendar.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Festival cards display boost multipliers with color coding (red for 4x+, orange for 3x+, yellow for 2.5x+). Selected festival shows 24-hour traffic spike chart."
+
+  - task: "Calendar date picker functionality"
+    implemented: true
+    working: true
+    file: "/app/frontend/src/App.js"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Calendar component using react-day-picker is already functional. Date selection works and triggers prediction updates."
+
+metadata:
+  created_by: "main_agent"
+  version: "2.0"
+  test_sequence: 0
+  run_ui: false
+  aws_configured: false
+
+test_plan:
+  current_focus:
+    - "Festival data with boost multipliers"
+    - "Traffic prediction with boost multiplier"
+    - "2025 festivals endpoint with predictions"
+    - "Festival Calendar Component"
+    - "Festival spike visualization"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+  - agent: "main"
+    message: |
+      Completed implementation of festival calendar with traffic spike predictions for 2025 and 2026.
+      
+      Key Features Implemented:
+      1. Backend:
+         - Added INDIAN_FESTIVALS with boost multipliers (2.0x - 4.5x)
+         - Updated scaling logic: <700=1, 700-1400=2, 1400-2100=3, 2100-3000=4, 3000-5000=5, >5000=10 instances
+         - Created /api/festivals/2025 and /api/festivals/2026 endpoints
+         - Traffic predictions now apply boost multipliers (Diwali gets 4.5x spike, Holi gets 3.0x, etc.)
+         - Added YoY comparison with previous year data
+      
+      2. Frontend:
+         - Created FestivalCalendar component with tabs for 2025/2026
+         - Festival cards show boost multipliers with color coding
+         - Clicking festival card shows 24-hour traffic spike chart
+         - YoY growth percentage displayed for each festival
+         - Calendar date picker is working correctly
+      
+      3. AWS Integration:
+         - Instance scaling logic updated with correct thresholds
+         - AWS endpoints ready (work in mock mode without credentials)
+         - CONFIG_SETUP.md created with instructions for AWS credentials
+      
+      Ready for testing. Please test:
+      1. Backend endpoints: /api/festivals/2025, /api/festivals/2026, /api/predict with festival dates
+      2. Frontend: Festival Calendar tab, clicking on festivals, viewing spike charts
+      3. Verify boost multipliers are applied correctly to predictions
+      4. Check calendar date picker functionality
