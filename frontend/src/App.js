@@ -100,7 +100,16 @@ function App() {
   // Handle model change
   const handleModelChange = (model) => {
     setSelectedModel(model);
-    fetchPredictions(model);
+    fetchPredictions(model, selectedDate);
+  };
+
+  // Handle date change
+  const handleDateChange = (date) => {
+    if (date) {
+      setSelectedDate(date);
+      setCalendarOpen(false);
+      fetchPredictions(selectedModel, date);
+    }
   };
 
   // Load predictions on mount
