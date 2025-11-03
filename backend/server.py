@@ -46,12 +46,16 @@ FEATURE_COLUMNS = None
 
 try:
     # Model files in backend directory
+    import pickle
     catboost_path = ROOT_DIR / 'catboost_hourly_model.pkl'
     lightgbm_path = ROOT_DIR / 'lightgbm_hourly_model.pkl'
     xgboost_path = ROOT_DIR / 'xgboost_hourly_model.pkl'
     feature_cols_path = ROOT_DIR / 'feature_columns_hourly.pkl'
     
-    MODELS['catboost'] = joblib.load(catboost_path)
+    # Load models with encoding for compatibility
+    with open(catboost_path, 'rb') as f:
+        MODELS['catboost'] = pickle.load(f, encoding='latin1')
+    
     MODELS['lightgbm'] = joblib.load(lightgbm_path)
     MODELS['xgboost'] = joblib.load(xgboost_path)
     FEATURE_COLUMNS = joblib.load(feature_cols_path)
