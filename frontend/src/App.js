@@ -355,6 +355,10 @@ function App() {
             <CardContent>
               <div className="info-list">
                 <div className="info-item">
+                  <span className="info-key">Selected Date:</span>
+                  <span className="info-value">{format(selectedDate, 'MMM dd, yyyy')}</span>
+                </div>
+                <div className="info-item">
                   <span className="info-key">Model:</span>
                   <span className="info-value">{selectedModel.toUpperCase()}</span>
                 </div>
