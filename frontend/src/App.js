@@ -22,6 +22,7 @@ function App() {
   const [scalingResult, setScalingResult] = useState(null);
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [calendarOpen, setCalendarOpen] = useState(false);
+  const [nextFestival, setNextFestival] = useState(null);
   const [currentMetrics, setCurrentMetrics] = useState({
     avgLoad: 0,
     peakLoad: 0,
