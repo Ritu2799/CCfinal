@@ -141,6 +141,33 @@ function App() {
           </div>
           
           <div className="header-right">
+            <div className="date-picker-container">
+              <label className="date-label">Predict Date:</label>
+              <Popover open={calendarOpen} onOpenChange={setCalendarOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className="date-picker-button"
+                    data-testid="date-picker-button"
+                  >
+                    <CalendarDays className="calendar-icon-btn" />
+                    {format(selectedDate, 'MMM dd, yyyy')}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="calendar-popover" align="start">
+                  <CalendarComponent
+                    mode="single"
+                    selected={selectedDate}
+                    onSelect={handleDateChange}
+                    initialFocus
+                    fromDate={new Date(2024, 0, 1)}
+                    toDate={new Date(2026, 11, 31)}
+                    data-testid="calendar-component"
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
+            
             <div className="model-selector">
               <label className="model-label">ML Model:</label>
               <Select value={selectedModel} onValueChange={handleModelChange}>
