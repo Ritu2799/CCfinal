@@ -20,6 +20,8 @@ function App() {
   const [selectedModel, setSelectedModel] = useState('catboost');
   const [loading, setLoading] = useState(false);
   const [scalingResult, setScalingResult] = useState(null);
+  const [selectedDate, setSelectedDate] = useState(new Date());
+  const [calendarOpen, setCalendarOpen] = useState(false);
   const [currentMetrics, setCurrentMetrics] = useState({
     avgLoad: 0,
     peakLoad: 0,
