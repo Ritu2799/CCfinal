@@ -74,38 +74,88 @@ except Exception as e:
 CALENDARIFIC_API_KEY = os.environ.get('CALENDARIFIC_API_KEY', '')
 CALENDARIFIC_BASE_URL = 'https://calendarific.com/api/v2'
 
+# Hardcoded major festivals for 2024-2026 (fallback when API fails)
+HARDCODED_FESTIVALS = {
+    # 2024
+    '2024-01-26': 'Republic Day',
+    '2024-03-25': 'Holi',
+    '2024-04-17': 'Ram Navami',
+    '2024-08-15': 'Independence Day',
+    '2024-10-12': 'Dussehra',
+    '2024-11-01': 'Diwali',
+    '2024-11-02': 'Diwali (Day 2)',
+    '2024-12-25': 'Christmas',
+    
+    # 2025
+    '2025-01-26': 'Republic Day',
+    '2025-03-14': 'Holi',
+    '2025-04-06': 'Ram Navami',
+    '2025-08-15': 'Independence Day',
+    '2025-10-02': 'Dussehra',
+    '2025-10-20': 'Diwali',
+    '2025-10-21': 'Diwali (Day 2)',
+    '2025-12-25': 'Christmas',
+    '2025-12-31': 'New Year Eve',
+    
+    # 2026
+    '2026-01-26': 'Republic Day',
+    '2026-03-03': 'Holi',
+    '2026-03-27': 'Ram Navami',
+    '2026-08-15': 'Independence Day',
+    '2026-10-21': 'Dussehra',
+    '2026-11-08': 'Diwali',
+    '2026-11-09': 'Diwali (Day 2)',
+    '2026-12-25': 'Christmas',
+    '2026-12-31': 'New Year Eve',
+}
+
 def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str, Any]:
-    """Check if date is a festival using Calendarific API"""
+    """Check if date is a festival using Calendarific API with hardcoded fallback"""
     try:
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
         year = date_obj.year
         month = date_obj.month
         day = date_obj.day
         
-        # Call Calendarific API
-        url = f"{CALENDARIFIC_BASE_URL}/holidays"
-        params = {
-            'api_key': CALENDARIFIC_API_KEY,
-            'country': country,
-            'year': year,
-            'month': month,
-            'day': day
-        }
-        
-        response = requests.get(url, params=params, timeout=5)
-        
-        if response.status_code == 200:
-            data = response.json()
-            holidays = data.get('response', {}).get('holidays', [])
+        # First try API if key is available
+        if CALENDARIFIC_API_KEY:
+            url = f"{CALENDARIFIC_BASE_URL}/holidays"
+            params = {
+                'api_key': CALENDARIFIC_API_KEY,
+                'country': country,
+                'year': year,
+                'month': month,
+                'day': day
+            }
             
-            if holidays:
-                # Found festivals on this date
-                festival_names = [h['name'] for h in holidays]
-                return {
-                    'is_festival': 1,
-                    'festival_name': festival_names[0],
-                    'all_festivals': festival_names
-                }
+            try:
+                response = requests.get(url, params=params, timeout=5)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    # Check if API returned valid data
+                    if data.get('meta', {}).get('code') == 200:
+                        holidays = data.get('response', {}).get('holidays', [])
+                        
+                        if holidays:
+                            festival_names = [h['name'] for h in holidays]
+                            return {
+                                'is_festival': 1,
+                                'festival_name': festival_names[0],
+                                'all_festivals': festival_names
+                            }
+            except Exception as api_error:
+                logger.warning(f"Calendarific API error: {api_error}, using fallback")
+        
+        # Fallback to hardcoded festivals
+        if date_str in HARDCODED_FESTIVALS:
+            festival_name = HARDCODED_FESTIVALS[date_str]
+            return {
+                'is_festival': 1,
+                'festival_name': festival_name,
+                'all_festivals': [festival_name]
+            }
         
         return {'is_festival': 0, 'festival_name': 'None', 'all_festivals': []}
         
