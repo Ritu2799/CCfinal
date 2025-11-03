@@ -576,15 +576,19 @@ async def get_next_festival(model_name: str = 'catboost'):
                 avg_load = sum(loads) / len(loads)
                 peak_load = max(loads)
                 
-                # Recommended instances based on peak load
-                if peak_load > 5000:
-                    recommended_instances = 10
-                elif peak_load > 3000:
-                    recommended_instances = 5
-                elif peak_load > 1500:
-                    recommended_instances = 3
-                else:
+                # Recommended instances based on peak load (updated logic)
+                if peak_load < 700:
+                    recommended_instances = 1
+                elif peak_load < 1400:
                     recommended_instances = 2
+                elif peak_load < 2100:
+                    recommended_instances = 3
+                elif peak_load < 3000:
+                    recommended_instances = 4
+                elif peak_load < 5000:
+                    recommended_instances = 5
+                else:
+                    recommended_instances = 10
                 
                 return {
                     'festival_name': festival_info['festival_name'],
@@ -609,6 +613,213 @@ async def get_next_festival(model_name: str = 'catboost'):
         
     except Exception as e:
         logger.error(f"Next festival error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/festivals/2025")
+async def get_2025_festivals(model_name: str = 'catboost'):
+    """Get all 2025 festivals with predictions"""
+    try:
+        festivals_with_predictions = []
+        
+        # Get all 2025 festivals from hardcoded data
+        for date_str, festival_name in HARDCODED_FESTIVALS.items():
+            if date_str.startswith('2025'):
+                # Parse date
+                festival_date = datetime.strptime(date_str, '%Y-%m-%d')
+                
+                # Get 24-hour predictions for this festival
+                predictions = []
+                for hour in range(24):
+                    timestamp = festival_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                    pred = predict_traffic(timestamp, model_name)
+                    predictions.append(pred)
+                
+                # Calculate metrics
+                loads = [p['predicted_load'] for p in predictions]
+                avg_load = sum(loads) / len(loads)
+                peak_load = max(loads)
+                
+                # Recommended instances
+                if peak_load < 700:
+                    recommended_instances = 1
+                elif peak_load < 1400:
+                    recommended_instances = 2
+                elif peak_load < 2100:
+                    recommended_instances = 3
+                elif peak_load < 3000:
+                    recommended_instances = 4
+                elif peak_load < 5000:
+                    recommended_instances = 5
+                else:
+                    recommended_instances = 10
+                
+                # Try to find 2024 same festival for comparison
+                previous_year_data = None
+                date_2024 = date_str.replace('2025', '2024')
+                if date_2024 in HARDCODED_FESTIVALS and HARDCODED_FESTIVALS[date_2024] == festival_name:
+                    # Get 2024 predictions (simulated as historical data)
+                    prev_date = datetime.strptime(date_2024, '%Y-%m-%d')
+                    prev_predictions = []
+                    for hour in range(24):
+                        timestamp = prev_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                        pred = predict_traffic(timestamp, model_name)
+                        prev_predictions.append(pred)
+                    
+                    prev_loads = [p['predicted_load'] for p in prev_predictions]
+                    prev_avg_load = sum(prev_loads) / len(prev_loads)
+                    prev_peak_load = max(prev_loads)
+                    
+                    previous_year_data = {
+                        'date': date_2024,
+                        'avg_load': round(prev_avg_load),
+                        'peak_load': round(prev_peak_load),
+                        'growth_rate': round(((avg_load - prev_avg_load) / prev_avg_load) * 100, 2) if prev_avg_load > 0 else 0
+                    }
+                
+                festivals_with_predictions.append({
+                    'festival_name': festival_name,
+                    'date': date_str,
+                    'day_of_week': festival_date.strftime('%A'),
+                    'month': festival_date.strftime('%B'),
+                    'avg_load': round(avg_load),
+                    'peak_load': round(peak_load),
+                    'recommended_instances': recommended_instances,
+                    'previous_year': previous_year_data,
+                    'predictions': predictions
+                })
+        
+        # Sort by date
+        festivals_with_predictions.sort(key=lambda x: x['date'])
+        
+        return {
+            'year': 2025,
+            'total_festivals': len(festivals_with_predictions),
+            'festivals': festivals_with_predictions
+        }
+        
+    except Exception as e:
+        logger.error(f"2025 festivals error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/aws/instances")
+async def get_aws_instances():
+    """Get current AWS EC2 instances in Auto Scaling Group"""
+    try:
+        client = get_aws_autoscaling_client()
+        asg_name = os.environ.get('AWS_ASG_NAME', 'my-web-asg')
+        
+        if not client:
+            return {
+                'mode': 'mock',
+                'message': 'AWS credentials not configured',
+                'instances': []
+            }
+        
+        # Get Auto Scaling Group details
+        response = client.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[asg_name]
+        )
+        
+        if not response['AutoScalingGroups']:
+            return {
+                'mode': 'real',
+                'error': f'Auto Scaling Group "{asg_name}" not found',
+                'instances': []
+            }
+        
+        asg = response['AutoScalingGroups'][0]
+        
+        # Get instance details
+        ec2_client = boto3.client(
+            'ec2',
+            aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+            aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+            region_name=os.environ.get('AWS_REGION', 'us-east-1')
+        )
+        
+        instances = []
+        for instance in asg['Instances']:
+            instance_id = instance['InstanceId']
+            
+            # Get more details from EC2
+            ec2_response = ec2_client.describe_instances(InstanceIds=[instance_id])
+            if ec2_response['Reservations']:
+                ec2_instance = ec2_response['Reservations'][0]['Instances'][0]
+                
+                instances.append({
+                    'instance_id': instance_id,
+                    'instance_type': ec2_instance.get('InstanceType', 'unknown'),
+                    'state': ec2_instance['State']['Name'],
+                    'health_status': instance['HealthStatus'],
+                    'availability_zone': instance['AvailabilityZone'],
+                    'launch_time': ec2_instance.get('LaunchTime', '').isoformat() if ec2_instance.get('LaunchTime') else None,
+                    'private_ip': ec2_instance.get('PrivateIpAddress', 'N/A'),
+                    'public_ip': ec2_instance.get('PublicIpAddress', 'N/A')
+                })
+        
+        return {
+            'mode': 'real',
+            'asg_name': asg_name,
+            'desired_capacity': asg['DesiredCapacity'],
+            'min_size': asg['MinSize'],
+            'max_size': asg['MaxSize'],
+            'current_instances': len(instances),
+            'instances': instances
+        }
+        
+    except (ClientError, NoCredentialsError) as e:
+        logger.error(f"AWS instances error: {e}")
+        return {
+            'mode': 'error',
+            'error': str(e),
+            'instances': []
+        }
+
+@api_router.post("/aws/update-instance")
+async def update_aws_instance(instance_id: str, action: str):
+    """Update specific AWS instance (terminate, stop, start)"""
+    try:
+        if action not in ['terminate', 'stop', 'start']:
+            raise HTTPException(status_code=400, detail="Invalid action. Use 'terminate', 'stop', or 'start'")
+        
+        aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+        aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+        
+        if not aws_access_key or not aws_secret_key:
+            return {
+                'mode': 'mock',
+                'message': f'[MOCK] Would {action} instance {instance_id}',
+                'action': action,
+                'instance_id': instance_id
+            }
+        
+        ec2_client = boto3.client(
+            'ec2',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=os.environ.get('AWS_REGION', 'us-east-1')
+        )
+        
+        if action == 'terminate':
+            ec2_client.terminate_instances(InstanceIds=[instance_id])
+            message = f'Instance {instance_id} terminated'
+        elif action == 'stop':
+            ec2_client.stop_instances(InstanceIds=[instance_id])
+            message = f'Instance {instance_id} stopped'
+        elif action == 'start':
+            ec2_client.start_instances(InstanceIds=[instance_id])
+            message = f'Instance {instance_id} started'
+        
+        return {
+            'mode': 'real',
+            'success': True,
+            'action': action,
+            'instance_id': instance_id,
+            'message': message
+        }
+        
+    except (ClientError, NoCredentialsError) as e:
+        logger.error(f"AWS update instance error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Original routes
