@@ -124,7 +124,17 @@ def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str,
         month = date_obj.month
         day = date_obj.day
         
-        # First try API if key is available
+        # First check our Indian festivals list with boost values
+        if date_str in INDIAN_FESTIVALS:
+            festival_data = INDIAN_FESTIVALS[date_str]
+            return {
+                'is_festival': 1,
+                'festival_name': festival_data['name'],
+                'boost': festival_data['boost'],
+                'all_festivals': [festival_data['name']]
+            }
+        
+        # Try API if key is available
         if CALENDARIFIC_API_KEY:
             url = f"{CALENDARIFIC_BASE_URL}/holidays"
             params = {
@@ -150,25 +160,17 @@ def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str,
                             return {
                                 'is_festival': 1,
                                 'festival_name': festival_names[0],
+                                'boost': 1.5,  # Default boost for other festivals
                                 'all_festivals': festival_names
                             }
             except Exception as api_error:
                 logger.warning(f"Calendarific API error: {api_error}, using fallback")
         
-        # Fallback to hardcoded festivals
-        if date_str in HARDCODED_FESTIVALS:
-            festival_name = HARDCODED_FESTIVALS[date_str]
-            return {
-                'is_festival': 1,
-                'festival_name': festival_name,
-                'all_festivals': [festival_name]
-            }
-        
-        return {'is_festival': 0, 'festival_name': 'None', 'all_festivals': []}
+        return {'is_festival': 0, 'festival_name': 'None', 'boost': 1.0, 'all_festivals': []}
         
     except Exception as e:
         logger.warning(f"Calendarific API error: {e}")
-        return {'is_festival': 0, 'festival_name': 'None', 'all_festivals': []}
+        return {'is_festival': 0, 'festival_name': 'None', 'boost': 1.0, 'all_festivals': []}
 
 # ============================================================================
 # AWS AUTO SCALING INTEGRATION
