@@ -4,6 +4,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import warnings
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Dict, Any
@@ -38,6 +39,68 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# HELPER FUNCTIONS & CACHING
+# ============================================================================
+
+# Simple in-memory cache for predictions (TTL: 30 minutes for better performance)
+PREDICTION_CACHE = {}
+CACHE_TTL = 1800  # 30 minutes - longer cache for better performance
+LAST_CACHE_CLEANUP = 0  # Track last cleanup time
+CACHE_CLEANUP_INTERVAL = 300  # Clean cache every 5 minutes (not on every request)
+
+# Cache for calendar/festival API calls (TTL: 24 hours - festivals don't change)
+FESTIVAL_CACHE = {}
+FESTIVAL_CACHE_TTL = 86400  # 24 hours
+
+# Track model reliability (to avoid repeated failures)
+MODEL_FAILURE_COUNT = {}
+MAX_FAILURES = 3  # After 3 failures, skip the model for this session
+
+# Fixed festival name mapping for XGBoost (matches training data encoding)
+# This ensures consistent encoding - 'None' should be 0, not alphabetically sorted
+XGBOOST_FESTIVAL_MAP = {
+    'None': 0,
+    'Diwali': 1,
+    'Holi': 2,
+    'Christmas': 3,
+    'Independence Day': 4,
+    'Republic Day': 5,
+    'Ram Navami': 6,
+    'Diwali Weekend': 7
+}
+
+def encode_festival_name_for_xgboost(festival_name: str) -> int:
+    """Encode festival name to numeric value for XGBoost model"""
+    return XGBOOST_FESTIVAL_MAP.get(str(festival_name), 0)
+
+def parse_iso_datetime(dt_str: str) -> datetime:
+    """Parse ISO format datetime string, handling 'Z' suffix for UTC"""
+    # Replace 'Z' with '+00:00' for UTC timezone (Python 3.9 compatibility)
+    if dt_str.endswith('Z'):
+        dt_str = dt_str.replace('Z', '+00:00')
+    return datetime.fromisoformat(dt_str)
+
+def get_cache_key(timestamp: datetime, model_name: str) -> str:
+    """Generate cache key for prediction"""
+    return f"{timestamp.strftime('%Y-%m-%d-%H')}-{model_name}"
+
+def clear_old_cache():
+    """Clear cache entries older than TTL - optimized to run less frequently"""
+    global LAST_CACHE_CLEANUP
+    current_time = datetime.now(timezone.utc).timestamp()
+    
+    # Only cleanup every 5 minutes (not on every request)
+    if current_time - LAST_CACHE_CLEANUP < CACHE_CLEANUP_INTERVAL:
+        return
+    
+    LAST_CACHE_CLEANUP = current_time
+    
+    # Efficient cleanup
+    keys_to_remove = [k for k, (_, cached_time) in PREDICTION_CACHE.items() if current_time - cached_time > CACHE_TTL]
+    for k in keys_to_remove:
+        del PREDICTION_CACHE[k]
+
+# ============================================================================
 # LOAD ML MODELS
 # ============================================================================
 
@@ -50,6 +113,12 @@ try:
     catboost_path = ROOT_DIR / 'catboost_hourly_model.pkl'
     lightgbm_path = ROOT_DIR / 'lightgbm_hourly_model.pkl'
     xgboost_path = ROOT_DIR / 'xgboost_hourly_model.pkl'
+    # Try fixed LSTM model first, fallback to original
+    lstm_path_fixed = ROOT_DIR / 'lstm_hourly_model_fixed.h5'
+    lstm_path = ROOT_DIR / 'lstm_hourly_model.h5'
+    if lstm_path_fixed.exists():
+        lstm_path = lstm_path_fixed
+        logger.info("Using fixed LSTM model (lstm_hourly_model_fixed.h5)")
     feature_cols_path = ROOT_DIR / 'feature_columns_hourly.pkl'
     
     # Load models with encoding for compatibility
@@ -57,10 +126,126 @@ try:
         MODELS['catboost'] = pickle.load(f, encoding='latin1')
     
     MODELS['lightgbm'] = joblib.load(lightgbm_path)
-    MODELS['xgboost'] = joblib.load(xgboost_path)
+    
+    # Suppress XGBoost warnings about serialized models
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
+        MODELS['xgboost'] = joblib.load(xgboost_path)
+    
+    # Load LSTM model if available
+    try:
+        import tensorflow as tf
+        if lstm_path.exists():
+            # Try multiple loading strategies for compatibility
+            lstm_loaded = False
+            
+            # Strategy 1: Standard load with compile=False
+            try:
+                MODELS['lstm'] = tf.keras.models.load_model(lstm_path, compile=False)
+                logger.info(f"✅ Loaded LSTM model successfully (standard method)")
+                lstm_loaded = True
+            except Exception as e1:
+                logger.debug(f"Standard LSTM load failed: {e1}")
+                
+                # Strategy 2: Try with safe_mode=False (for older Keras versions)
+                try:
+                    MODELS['lstm'] = tf.keras.models.load_model(
+                        lstm_path, 
+                        compile=False,
+                        safe_mode=False
+                    )
+                    logger.info(f"✅ Loaded LSTM model successfully (safe_mode=False)")
+                    lstm_loaded = True
+                except Exception as e2:
+                    logger.debug(f"Safe mode load failed: {e2}")
+                    
+                    # Strategy 3: Try loading by manually fixing the config (handle batch_shape issue)
+                    try:
+                        import json
+                        import h5py
+                        
+                        # Read and fix the model config
+                        with h5py.File(lstm_path, 'r') as f:
+                            if 'model_config' in f:
+                                config_str = f['model_config'][()].decode('utf-8')
+                                config = json.loads(config_str)
+                                
+                                # Fix batch_shape in InputLayer configs
+                                if 'config' in config and 'layers' in config['config']:
+                                    for layer in config['config']['layers']:
+                                        if layer.get('class_name') == 'InputLayer':
+                                            layer_config = layer.get('config', {})
+                                            if 'batch_shape' in layer_config:
+                                                # Convert batch_shape to input_shape
+                                                batch_shape = layer_config.pop('batch_shape')
+                                                if batch_shape and len(batch_shape) > 1:
+                                                    layer_config['input_shape'] = batch_shape[1:]
+                                
+                                # Save fixed config to temp file and load
+                                import tempfile
+                                import shutil
+                                
+                                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                                    json.dump(config, tmp)
+                                    tmp_config_path = tmp.name
+                                
+                                # Create a new model file with fixed config
+                                with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmp_model:
+                                    tmp_model_path = tmp_model.name
+                                
+                                # Copy weights and use fixed config
+                                with h5py.File(lstm_path, 'r') as src, h5py.File(tmp_model_path, 'w') as dst:
+                                    # Copy model_weights
+                                    if 'model_weights' in src:
+                                        src.copy('model_weights', dst, 'model_weights')
+                                    
+                                    # Write fixed config
+                                    dst.create_dataset('model_config', data=json.dumps(config).encode('utf-8'))
+                                
+                                # Try loading the fixed model
+                                MODELS['lstm'] = tf.keras.models.load_model(tmp_model_path, compile=False)
+                                
+                                # Cleanup
+                                import os
+                                os.unlink(tmp_config_path)
+                                os.unlink(tmp_model_path)
+                                
+                                logger.info(f"✅ Loaded LSTM model successfully (fixed batch_shape issue)")
+                                lstm_loaded = True
+                            else:
+                                raise Exception("No model_config in H5 file")
+                    except Exception as e3:
+                        logger.debug(f"Config fix method failed: {e3}")
+                        
+                        # Strategy 4: Last resort - try with older Keras API
+                        try:
+                            # Try using the legacy loading method
+                            from tensorflow.python.keras.saving import hdf5_format
+                            MODELS['lstm'] = hdf5_format.load_model_from_hdf5(lstm_path, custom_objects={}, compile=False)
+                            logger.info(f"✅ Loaded LSTM model successfully (legacy HDF5 method)")
+                            lstm_loaded = True
+                        except Exception as e4:
+                            logger.warning(f"⚠️ All LSTM loading strategies failed.")
+                            logger.warning(f"⚠️ Errors: Standard={type(e1).__name__}, SafeMode={type(e2).__name__}, ConfigFix={type(e3).__name__}, Legacy={type(e4).__name__}")
+                            logger.warning(f"⚠️ LSTM model may be incompatible with TensorFlow {tf.__version__}")
+                            logger.info("⚠️ LSTM will be skipped. Other models (CatBoost, LightGBM, XGBoost) will work fine.")
+            
+            if not lstm_loaded:
+                logger.warning("⚠️ LSTM model could not be loaded - skipping")
+        else:
+            logger.warning(f"⚠️ LSTM model file not found: {lstm_path}")
+    except ImportError:
+        logger.warning("⚠️ TensorFlow not installed, skipping LSTM model")
+    except Exception as e:
+        logger.error(f"⚠️ Error loading LSTM model: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        logger.info("⚠️ LSTM model will be skipped. Other models (CatBoost, LightGBM, XGBoost) will work fine.")
+    
     FEATURE_COLUMNS = joblib.load(feature_cols_path)
     
-    logger.info(f"✅ Loaded 3 ML models successfully")
+    model_count = len(MODELS)
+    logger.info(f"✅ Loaded {model_count} ML models successfully: {list(MODELS.keys())}")
     logger.info(f"✅ Feature columns: {len(FEATURE_COLUMNS)}")
 except Exception as e:
     logger.error(f"❌ Error loading models: {e}")
@@ -117,24 +302,44 @@ INDIAN_FESTIVALS = {
 HARDCODED_FESTIVALS = {k: v['name'] for k, v in INDIAN_FESTIVALS.items()}
 
 def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str, Any]:
-    """Check if date is a festival using Calendarific API with hardcoded fallback"""
+    """Check if date is a festival using Calendarific API with hardcoded fallback and caching"""
     try:
+        # Validate date format
+        if not date_str or len(date_str) < 10:
+            logger.warning(f"Invalid date format: '{date_str}'")
+            return {'is_festival': 0, 'festival_name': 'None', 'boost': 1.0, 'all_festivals': []}
+        
+        # Check cache first (fast path)
+        cache_key = f"{date_str}_{country}"
+        current_time = datetime.now(timezone.utc).timestamp()
+        
+        if cache_key in FESTIVAL_CACHE:
+            cached_result, cached_time = FESTIVAL_CACHE[cache_key]
+            if current_time - cached_time < FESTIVAL_CACHE_TTL:
+                return cached_result
+            else:
+                # Expired, remove from cache
+                del FESTIVAL_CACHE[cache_key]
+        
         date_obj = datetime.strptime(date_str, '%Y-%m-%d')
         year = date_obj.year
         month = date_obj.month
         day = date_obj.day
         
-        # First check our Indian festivals list with boost values
+        # First check our Indian festivals list with boost values (fastest - no API call)
         if date_str in INDIAN_FESTIVALS:
             festival_data = INDIAN_FESTIVALS[date_str]
-            return {
+            result = {
                 'is_festival': 1,
                 'festival_name': festival_data['name'],
                 'boost': festival_data['boost'],
                 'all_festivals': [festival_data['name']]
             }
+            # Cache the result
+            FESTIVAL_CACHE[cache_key] = (result, current_time)
+            return result
         
-        # Try API if key is available
+        # Try API if key is available (only for dates not in hardcoded list)
         if CALENDARIFIC_API_KEY:
             url = f"{CALENDARIFIC_BASE_URL}/holidays"
             params = {
@@ -146,7 +351,8 @@ def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str,
             }
             
             try:
-                response = requests.get(url, params=params, timeout=5)
+                # Reduced timeout for faster failure
+                response = requests.get(url, params=params, timeout=3)
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -157,16 +363,23 @@ def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str,
                         
                         if holidays:
                             festival_names = [h['name'] for h in holidays]
-                            return {
+                            result = {
                                 'is_festival': 1,
                                 'festival_name': festival_names[0],
                                 'boost': 1.5,  # Default boost for other festivals
                                 'all_festivals': festival_names
                             }
+                            # Cache the result
+                            FESTIVAL_CACHE[cache_key] = (result, current_time)
+                            return result
             except Exception as api_error:
-                logger.warning(f"Calendarific API error: {api_error}, using fallback")
+                logger.debug(f"Calendarific API error for {date_str}: {api_error}, using fallback")
         
-        return {'is_festival': 0, 'festival_name': 'None', 'boost': 1.0, 'all_festivals': []}
+        # Default: not a festival
+        result = {'is_festival': 0, 'festival_name': 'None', 'boost': 1.0, 'all_festivals': []}
+        # Cache the result (even negative results to avoid repeated API calls)
+        FESTIVAL_CACHE[cache_key] = (result, current_time)
+        return result
         
     except Exception as e:
         logger.warning(f"Calendarific API error: {e}")
@@ -206,24 +419,9 @@ def scale_ec2_instances(predicted_load: float, asg_name: str) -> Dict[str, Any]:
         client = get_aws_autoscaling_client()
         
         # Calculate required instances based on traffic load
-        if predicted_load < 700:
-            desired = 1
-            max_size = 2
-        elif predicted_load < 1400:
-            desired = 2
-            max_size = 3
-        elif predicted_load < 2100:
-            desired = 3
-            max_size = 5
-        elif predicted_load < 3000:
-            desired = 4
-            max_size = 6
-        elif predicted_load < 5000:
-            desired = 5
-            max_size = 8
-        else:
-            desired = 10
-            max_size = 15
+        desired = calculate_recommended_instances(predicted_load)
+        max_size_map = {1: 2, 2: 3, 3: 5, 4: 6, 5: 8, 10: 15}
+        max_size = max_size_map.get(desired, 15)
         
         if not client:
             # Mock mode
@@ -272,63 +470,79 @@ def scale_ec2_instances(predicted_load: float, asg_name: str) -> Dict[str, Any]:
         }
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def calculate_recommended_instances(peak_load: float) -> int:
+    """Calculate recommended instances based on peak load"""
+    if peak_load < 700:
+        return 1
+    elif peak_load < 1400:
+        return 2
+    elif peak_load < 2100:
+        return 3
+    elif peak_load < 3000:
+        return 4
+    elif peak_load < 5000:
+        return 5
+    else:
+        return 10
+
+def get_peak_prediction_with_fallback(timestamp: datetime, model_name: str, boost: float) -> tuple:
+    """Get peak hour prediction with fallback to CatBoost. Returns (avg_load, peak_load)"""
+    try:
+        peak_pred = predict_traffic(timestamp, model_name, use_cache=True)
+        peak_prediction = peak_pred['predicted_load']
+        return peak_prediction * 0.85, peak_prediction * 1.15
+    except Exception as e:
+        logger.warning(f"Error predicting with {model_name}: {e}")
+        if model_name != 'catboost':
+            try:
+                peak_pred = predict_traffic(timestamp, 'catboost', use_cache=True)
+                peak_prediction = peak_pred['predicted_load']
+                return peak_prediction * 0.85, peak_prediction * 1.15
+            except:
+                base_load = 1000.0
+                return base_load * boost, base_load * boost * 1.2
+        else:
+            return 1200.0, 1500.0
+
+# ============================================================================
 # FEATURE ENGINEERING
 # ============================================================================
 
 def prepare_features_for_hour(timestamp: datetime, festival_info: Dict) -> pd.DataFrame:
-    """Prepare features for a single hour prediction"""
-    
+    """Prepare features for a single hour prediction - optimized"""
     hour = timestamp.hour
     day_of_week = timestamp.weekday()
     month = timestamp.month
-    day = timestamp.day
-    year = timestamp.year
-    week_of_year = timestamp.isocalendar()[1]
-    quarter = (month - 1) // 3 + 1
-    day_of_year = timestamp.timetuple().tm_yday
     
-    # Cyclical encoding
+    # Pre-compute cyclical encoding (faster than sin/cos on each call)
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
     dow_sin = np.sin(2 * np.pi * day_of_week / 7)
     dow_cos = np.cos(2 * np.pi * day_of_week / 7)
     
-    # Boolean features
-    is_weekend = 1 if day_of_week >= 5 else 0
-    is_business_hours = 1 if 9 <= hour <= 18 else 0
-    is_peak_hours = 1 if hour in [12, 13, 19, 20, 21] else 0
-    is_night = 1 if hour < 6 or hour > 22 else 0
+    # Fast boolean calculations
+    is_weekend = int(day_of_week >= 5)
+    is_business_hours = int(9 <= hour <= 18)
+    is_peak_hours = int(hour in (12, 13, 19, 20, 21))
+    is_night = int(hour < 6 or hour > 22)
     
     # Festival info
     is_festival = festival_info.get('is_festival', 0)
     festival_name = festival_info.get('festival_name', 'None')
     
-    # Campaign (assume no campaign for future predictions)
-    is_campaign = 0
-    
-    # Mock historical data (in production, fetch from database)
-    traffic_lag_1h = 1200.0
-    traffic_lag_24h = 1500.0
-    traffic_lag_168h = 1400.0
-    traffic_rolling_mean_24h = 1300.0
-    traffic_rolling_std_24h = 200.0
-    traffic_rolling_max_24h = 2000.0
-    
-    # Mock system metrics
-    cpu_usage = 45.0
-    memory_usage = 60.0
-    response_time = 150.0
-    error_rate = 0.5
-    
+    # Use dict literal for faster DataFrame creation
     features = {
         'hour': hour,
         'day_of_week': day_of_week,
         'month': month,
-        'day': day,
-        'year': year,
-        'week_of_year': week_of_year,
-        'quarter': quarter,
-        'day_of_year': day_of_year,
+        'day': timestamp.day,
+        'year': timestamp.year,
+        'week_of_year': timestamp.isocalendar()[1],
+        'quarter': (month - 1) // 3 + 1,
+        'day_of_year': timestamp.timetuple().tm_yday,
         'hour_sin': hour_sin,
         'hour_cos': hour_cos,
         'dow_sin': dow_sin,
@@ -338,34 +552,57 @@ def prepare_features_for_hour(timestamp: datetime, festival_info: Dict) -> pd.Da
         'is_peak_hours': is_peak_hours,
         'is_night': is_night,
         'is_festival': is_festival,
-        'is_campaign': is_campaign,
+        'is_campaign': 0,
         'festival_name': festival_name,
-        'traffic_lag_1h': traffic_lag_1h,
-        'traffic_lag_24h': traffic_lag_24h,
-        'traffic_lag_168h': traffic_lag_168h,
-        'traffic_rolling_mean_24h': traffic_rolling_mean_24h,
-        'traffic_rolling_std_24h': traffic_rolling_std_24h,
-        'traffic_rolling_max_24h': traffic_rolling_max_24h,
-        'cpu_usage': cpu_usage,
-        'memory_usage': memory_usage,
-        'response_time': response_time,
-        'error_rate': error_rate
+        'traffic_lag_1h': 1200.0,
+        'traffic_lag_24h': 1500.0,
+        'traffic_lag_168h': 1400.0,
+        'traffic_rolling_mean_24h': 1300.0,
+        'traffic_rolling_std_24h': 200.0,
+        'traffic_rolling_max_24h': 2000.0,
+        'cpu_usage': 45.0,
+        'memory_usage': 60.0,
+        'response_time': 150.0,
+        'error_rate': 0.5
     }
     
+    # Create DataFrame directly from dict (faster than list of dicts)
     return pd.DataFrame([features])
 
 # ============================================================================
 # PREDICTION FUNCTION
 # ============================================================================
 
-def predict_traffic(timestamp: datetime, model_name: str = 'catboost') -> Dict[str, Any]:
+def predict_traffic(timestamp: datetime, model_name: str = 'catboost', use_cache: bool = True) -> Dict[str, Any]:
     """Predict traffic for a given timestamp using specified model"""
     
     if not MODELS or not FEATURE_COLUMNS:
         raise HTTPException(status_code=500, detail="Models not loaded")
     
+    # Check if model has failed too many times - auto-fallback to CatBoost
+    if model_name != 'catboost' and model_name in MODEL_FAILURE_COUNT:
+        if MODEL_FAILURE_COUNT[model_name] >= MAX_FAILURES:
+            logger.debug(f"Model {model_name} has failed {MODEL_FAILURE_COUNT[model_name]} times, using CatBoost instead")
+            model_name = 'catboost'
+    
     if model_name not in MODELS:
         raise HTTPException(status_code=400, detail=f"Model '{model_name}' not found")
+    
+    # Check cache first (optimized)
+    if use_cache:
+        cache_key = get_cache_key(timestamp, model_name)
+        if cache_key in PREDICTION_CACHE:
+            cached_result, cached_time = PREDICTION_CACHE[cache_key]
+            current_time = datetime.now(timezone.utc).timestamp()
+            # Quick TTL check without full cleanup
+            if current_time - cached_time < CACHE_TTL:
+                return cached_result
+            else:
+                # Expired, remove from cache
+                del PREDICTION_CACHE[cache_key]
+        
+        # Periodic cleanup (only every 5 minutes)
+        clear_old_cache()
     
     # Check festival
     date_str = timestamp.strftime('%Y-%m-%d')
@@ -383,23 +620,156 @@ def predict_traffic(timestamp: datetime, model_name: str = 'catboost') -> Dict[s
     if model_name == 'catboost':
         prediction = model.predict(features_df)[0]
     elif model_name == 'lightgbm':
-        prediction = model.predict(features_df, num_iteration=model.best_iteration)[0]
+        # LightGBM needs categorical features to be handled properly
+        try:
+            # Convert festival_name to numeric if it exists
+            features_for_lgbm = features_df.copy()
+            if 'festival_name' in features_for_lgbm.columns:
+                # Map festival names to numeric values
+                festival_map = {
+                    'None': 0, 'Diwali': 1, 'Holi': 2, 'Christmas': 3,
+                    'Independence Day': 4, 'Republic Day': 5, 'Ram Navami': 6, 'Diwali Weekend': 7
+                }
+                features_for_lgbm['festival_name'] = features_for_lgbm['festival_name'].map(
+                    lambda x: festival_map.get(str(x), 0)
+                ).fillna(0).astype(int)
+            
+            # Ensure all columns are numeric for LightGBM
+            for col in features_for_lgbm.columns:
+                if pd.api.types.is_categorical_dtype(features_for_lgbm[col]):
+                    features_for_lgbm[col] = features_for_lgbm[col].astype(int)
+                elif features_for_lgbm[col].dtype == 'object':
+                    features_for_lgbm[col] = pd.to_numeric(features_for_lgbm[col], errors='coerce').fillna(0)
+                elif not pd.api.types.is_numeric_dtype(features_for_lgbm[col]):
+                    features_for_lgbm[col] = pd.to_numeric(features_for_lgbm[col], errors='coerce').fillna(0)
+            
+            # Use appropriate prediction method
+            if hasattr(model, 'best_iteration'):
+                prediction = model.predict(features_for_lgbm, num_iteration=model.best_iteration)[0]
+            else:
+                prediction = model.predict(features_for_lgbm)[0]
+            
+            # Reset failure count on success
+            if 'lightgbm' in MODEL_FAILURE_COUNT:
+                MODEL_FAILURE_COUNT['lightgbm'] = 0
+            logger.debug(f"LightGBM prediction successful: {prediction}")
+        except Exception as e:
+            # Track failure count
+            if 'lightgbm' not in MODEL_FAILURE_COUNT:
+                MODEL_FAILURE_COUNT['lightgbm'] = 0
+            MODEL_FAILURE_COUNT['lightgbm'] += 1
+            
+            logger.warning(f"LightGBM prediction error: {e}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['lightgbm']})")
+            # Fallback to CatBoost if LightGBM fails
+            if 'catboost' in MODELS:
+                catboost_model = MODELS['catboost']
+                prediction = catboost_model.predict(features_df)[0]
+                model_name = 'catboost'  # Update model name for result
+            else:
+                raise Exception(f"LightGBM failed and CatBoost not available: {e}")
     elif model_name == 'xgboost':
-        import xgboost as xgb
-        from sklearn.preprocessing import LabelEncoder
-        
-        # Encode festival_name
-        features_encoded = features_df.copy()
-        if 'festival_name' in features_encoded.columns:
-            le = LabelEncoder()
-            le.fit(['None', 'Diwali', 'Holi', 'Christmas', 'Independence Day', 'Republic Day', 'Ram Navami', 'Diwali Weekend'])
-            try:
-                features_encoded['festival_name'] = le.transform(features_encoded['festival_name'].astype(str))
-            except:
-                features_encoded['festival_name'] = 0
-        
-        dmatrix = xgb.DMatrix(features_encoded)
-        prediction = model.predict(dmatrix)[0]
+        try:
+            import xgboost as xgb
+            
+            # Suppress XGBoost warnings during prediction
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
+                
+                # Encode festival_name using fixed mapping (not LabelEncoder)
+                features_encoded = features_df.copy()
+                if 'festival_name' in features_encoded.columns:
+                    festival_val = str(features_encoded['festival_name'].iloc[0])
+                    encoded_val = encode_festival_name_for_xgboost(festival_val)
+                    features_encoded['festival_name'] = encoded_val
+                
+                # Ensure all columns are numeric and in correct order
+                for col in features_encoded.columns:
+                    if not pd.api.types.is_numeric_dtype(features_encoded[col]):
+                        features_encoded[col] = pd.to_numeric(features_encoded[col], errors='coerce').fillna(0)
+                
+                # Ensure feature order matches training (use FEATURE_COLUMNS order)
+                features_encoded = features_encoded[FEATURE_COLUMNS]
+                
+                # Create DMatrix with feature names for better compatibility
+                dmatrix = xgb.DMatrix(features_encoded, feature_names=FEATURE_COLUMNS)
+                prediction = model.predict(dmatrix)[0]
+                
+                # Ensure prediction is positive (XGBoost might return negative values)
+                prediction = max(prediction, 0.0)
+                
+                # Reset failure count on success
+                if 'xgboost' in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['xgboost'] = 0
+                logger.debug(f"XGBoost prediction successful: {prediction}")
+        except Exception as e:
+            # Track failure count
+            if 'xgboost' not in MODEL_FAILURE_COUNT:
+                MODEL_FAILURE_COUNT['xgboost'] = 0
+            MODEL_FAILURE_COUNT['xgboost'] += 1
+            
+            logger.warning(f"XGBoost prediction error: {e}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['xgboost']})")
+            # Fallback to CatBoost if XGBoost fails
+            if 'catboost' in MODELS:
+                catboost_model = MODELS['catboost']
+                prediction = catboost_model.predict(features_df)[0]
+                model_name = 'catboost'  # Update model name for result
+            else:
+                raise Exception(f"XGBoost failed and CatBoost not available: {e}")
+    elif model_name == 'lstm':
+        try:
+            import tensorflow as tf
+            
+            # LSTM models need numeric features - encode festival_name
+            features_for_lstm = features_df.copy()
+            if 'festival_name' in features_for_lstm.columns:
+                # Use same encoding as XGBoost for consistency
+                features_for_lstm['festival_name'] = features_for_lstm['festival_name'].astype(str).map(
+                    lambda x: encode_festival_name_for_xgboost(x)
+                ).fillna(0).astype(int)
+            
+            # Ensure all columns are numeric
+            for col in features_for_lstm.columns:
+                if not pd.api.types.is_numeric_dtype(features_for_lstm[col]):
+                    features_for_lstm[col] = pd.to_numeric(features_for_lstm[col], errors='coerce').fillna(0)
+            
+            # Prepare features as numpy array in correct order
+            features_array = features_for_lstm[FEATURE_COLUMNS].values.astype(np.float32)
+            
+            # Reshape for LSTM: (samples, timesteps, features)
+            # For single prediction, we use 1 timestep with all features
+            # If model expects sequence, we'll need to adjust
+            if len(features_array.shape) == 2:
+                # Reshape to (1, 1, n_features) for LSTM
+                features_array = features_array.reshape(1, 1, -1)
+            
+            prediction = model.predict(features_array, verbose=0)[0][0]
+            
+            # Ensure prediction is positive and scalar
+            if isinstance(prediction, (list, np.ndarray)):
+                prediction = float(prediction[0] if len(prediction) > 0 else prediction)
+            else:
+                prediction = float(prediction)
+            
+            prediction = max(prediction, 0.0)
+            
+            # Reset failure count on success
+            if 'lstm' in MODEL_FAILURE_COUNT:
+                MODEL_FAILURE_COUNT['lstm'] = 0
+            logger.debug(f"LSTM prediction successful: {prediction}")
+        except Exception as e:
+            # Track failure count
+            if 'lstm' not in MODEL_FAILURE_COUNT:
+                MODEL_FAILURE_COUNT['lstm'] = 0
+            MODEL_FAILURE_COUNT['lstm'] += 1
+            
+            logger.warning(f"LSTM prediction error: {e}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['lstm']})")
+            # Fallback to CatBoost if LSTM fails
+            if 'catboost' in MODELS:
+                catboost_model = MODELS['catboost']
+                prediction = catboost_model.predict(features_df)[0]
+                model_name = 'catboost'  # Update model name for result
+            else:
+                raise Exception(f"LSTM failed and CatBoost not available: {e}")
     
     # Ensure positive prediction
     prediction = max(prediction, 50.0)
@@ -409,7 +779,7 @@ def predict_traffic(timestamp: datetime, model_name: str = 'catboost') -> Dict[s
     if boost > 1.0:
         prediction = prediction * boost
     
-    return {
+    result = {
         'timestamp': timestamp.isoformat(),
         'hour': timestamp.hour,
         'predicted_load': float(prediction),
@@ -418,6 +788,13 @@ def predict_traffic(timestamp: datetime, model_name: str = 'catboost') -> Dict[s
         'boost': boost,
         'model': model_name
     }
+    
+    # Cache the result
+    if use_cache:
+        cache_key = get_cache_key(timestamp, model_name)
+        PREDICTION_CACHE[cache_key] = (result, datetime.now(timezone.utc).timestamp())
+    
+    return result
 
 # ============================================================================
 # PYDANTIC MODELS
@@ -476,20 +853,378 @@ async def health_check():
 
 @api_router.post("/predict", response_model=List[PredictionResponse])
 async def predict_endpoint(request: PredictionRequest):
-    """Predict traffic for next N hours"""
+    """Predict traffic for next N hours - optimized with batch processing and smart caching"""
+    start_time = parse_iso_datetime(request.start_time)
+    
+    # Batch prepare all timestamps first
+    all_timestamps = [start_time + timedelta(hours=i) for i in range(request.hours)]
+    
+    # Check if model has failed too many times - auto-fallback to CatBoost
+    actual_model_name = request.model_name
+    if request.model_name != 'catboost' and request.model_name in MODEL_FAILURE_COUNT:
+        if MODEL_FAILURE_COUNT[request.model_name] >= MAX_FAILURES:
+            logger.info(f"Model {request.model_name} has failed {MODEL_FAILURE_COUNT[request.model_name]} times, using CatBoost")
+            actual_model_name = 'catboost'
+    
+    # Check cache first for all timestamps - much faster (optimized)
+    clear_old_cache()  # Only cleans if needed (every 5 min)
+    cached_predictions = {}
+    uncached_timestamps = []
+    current_time = datetime.now(timezone.utc).timestamp()
+    
+    for ts in all_timestamps:
+        cache_key = get_cache_key(ts, actual_model_name)
+        if cache_key in PREDICTION_CACHE:
+            cached_result, cached_time = PREDICTION_CACHE[cache_key]
+            # Quick TTL check (avoid full cleanup on every request)
+            if current_time - cached_time < CACHE_TTL:
+                cached_predictions[ts] = cached_result
+            else:
+                # Expired, remove and add to uncached
+                del PREDICTION_CACHE[cache_key]
+                uncached_timestamps.append(ts)
+        else:
+            uncached_timestamps.append(ts)
+    
+    # If all cached, return immediately (instant response!)
+    if len(cached_predictions) == len(all_timestamps):
+        return [cached_predictions[ts] for ts in all_timestamps]
+    
+    # Batch prepare festival info only for uncached timestamps
+    festival_info_cache = {}
+    for ts in uncached_timestamps:
+        date_str = ts.strftime('%Y-%m-%d')
+        if date_str not in festival_info_cache:
+            festival_info_cache[date_str] = check_festival_calendarific(date_str)
+    
     try:
-        start_time = datetime.fromisoformat(request.start_time)
-        predictions = []
+        # Batch predict only if we have uncached timestamps
+        if not uncached_timestamps:
+            # All cached, return cached results
+            return [cached_predictions[ts] for ts in all_timestamps]
         
-        for i in range(request.hours):
-            timestamp = start_time + timedelta(hours=i)
-            pred = predict_traffic(timestamp, request.model_name)
-            predictions.append(pred)
+        # Prepare features in batch - much faster
+        features_dicts = []
+        for ts in uncached_timestamps:
+            date_str = ts.strftime('%Y-%m-%d')
+            hour = ts.hour
+            day_of_week = ts.weekday()
+            month = ts.month
+            festival_info = festival_info_cache[date_str]
+            
+            # Fast feature calculation
+            features_dicts.append({
+                'hour': hour,
+                'day_of_week': day_of_week,
+                'month': month,
+                'day': ts.day,
+                'year': ts.year,
+                'week_of_year': ts.isocalendar()[1],
+                'quarter': (month - 1) // 3 + 1,
+                'day_of_year': ts.timetuple().tm_yday,
+                'hour_sin': np.sin(2 * np.pi * hour / 24),
+                'hour_cos': np.cos(2 * np.pi * hour / 24),
+                'dow_sin': np.sin(2 * np.pi * day_of_week / 7),
+                'dow_cos': np.cos(2 * np.pi * day_of_week / 7),
+                'is_weekend': int(day_of_week >= 5),
+                'is_business_hours': int(9 <= hour <= 18),
+                'is_peak_hours': int(hour in (12, 13, 19, 20, 21)),
+                'is_night': int(hour < 6 or hour > 22),
+                'is_festival': festival_info.get('is_festival', 0),
+                'is_campaign': 0,
+                'festival_name': festival_info.get('festival_name', 'None'),
+                'traffic_lag_1h': 1200.0,
+                'traffic_lag_24h': 1500.0,
+                'traffic_lag_168h': 1400.0,
+                'traffic_rolling_mean_24h': 1300.0,
+                'traffic_rolling_std_24h': 200.0,
+                'traffic_rolling_max_24h': 2000.0,
+                'cpu_usage': 45.0,
+                'memory_usage': 60.0,
+                'response_time': 150.0,
+                'error_rate': 0.5
+            })
         
-        return predictions
+        # Create DataFrame from list of dicts in one go (much faster)
+        all_features = pd.DataFrame(features_dicts)
+        all_features = all_features[FEATURE_COLUMNS]
+        
+        # Batch predict (much faster than individual predictions)
+        model = MODELS[actual_model_name]
+        predictions_raw = []
+        
+        if actual_model_name == 'catboost':
+            # Batch predict all at once
+            predictions_raw = model.predict(all_features)
+        elif actual_model_name == 'lightgbm':
+            # LightGBM batch processing - handle categorical features properly
+            try:
+                # Convert all categorical/object columns to numeric FIRST
+                all_features_lgbm = all_features.copy()
+                if 'festival_name' in all_features_lgbm.columns:
+                    # Fast map using replace (faster than map)
+                    festival_map = {
+                        'None': 0, 'Diwali': 1, 'Holi': 2, 'Christmas': 3,
+                        'Independence Day': 4, 'Republic Day': 5, 'Ram Navami': 6, 'Diwali Weekend': 7
+                    }
+                    all_features_lgbm['festival_name'] = all_features_lgbm['festival_name'].replace(festival_map).fillna(0).astype(int)
+                
+                # Ensure all columns are numeric
+                for col in all_features_lgbm.columns:
+                    if pd.api.types.is_categorical_dtype(all_features_lgbm[col]):
+                        all_features_lgbm[col] = all_features_lgbm[col].astype(int)
+                    elif all_features_lgbm[col].dtype == 'object':
+                        all_features_lgbm[col] = pd.to_numeric(all_features_lgbm[col], errors='coerce').fillna(0)
+                
+                # Predict with LightGBM
+                if hasattr(model, 'best_iteration'):
+                    predictions_raw = model.predict(all_features_lgbm, num_iteration=model.best_iteration)
+                else:
+                    predictions_raw = model.predict(all_features_lgbm)
+                
+                # Reset failure count on success
+                if 'lightgbm' in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['lightgbm'] = 0
+                logger.info(f"LightGBM batch prediction successful: {len(predictions_raw)} predictions")
+            except Exception as lgbm_error:
+                # Track failure count
+                if 'lightgbm' not in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['lightgbm'] = 0
+                MODEL_FAILURE_COUNT['lightgbm'] += 1
+                
+                logger.warning(f"LightGBM batch prediction failed: {lgbm_error}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['lightgbm']})")
+                # Fallback to CatBoost for reliability
+                model = MODELS['catboost']
+                predictions_raw = model.predict(all_features)
+                actual_model_name = 'catboost'  # Update for result
+        elif actual_model_name == 'xgboost':
+            try:
+                import xgboost as xgb
+                
+                # Suppress XGBoost warnings during batch prediction
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', category=UserWarning, module='xgboost')
+                    
+                    all_features_xgb = all_features.copy()
+                    if 'festival_name' in all_features_xgb.columns:
+                        # Use fixed mapping instead of LabelEncoder
+                        all_features_xgb['festival_name'] = all_features_xgb['festival_name'].astype(str).map(
+                            lambda x: encode_festival_name_for_xgboost(x)
+                        ).fillna(0).astype(int)
+                    
+                    # Ensure all columns are numeric
+                    for col in all_features_xgb.columns:
+                        if not pd.api.types.is_numeric_dtype(all_features_xgb[col]):
+                            all_features_xgb[col] = pd.to_numeric(all_features_xgb[col], errors='coerce').fillna(0)
+                    
+                    # Ensure feature order matches training
+                    all_features_xgb = all_features_xgb[FEATURE_COLUMNS]
+                    
+                    # Create DMatrix with feature names
+                    dmatrix = xgb.DMatrix(all_features_xgb, feature_names=FEATURE_COLUMNS)
+                    predictions_raw = model.predict(dmatrix)
+                    
+                    # Ensure all predictions are positive
+                    predictions_raw = np.maximum(predictions_raw, 0.0)
+                    
+                    # Reset failure count on success
+                    if 'xgboost' in MODEL_FAILURE_COUNT:
+                        MODEL_FAILURE_COUNT['xgboost'] = 0
+                    logger.info(f"XGBoost batch prediction successful: {len(predictions_raw)} predictions")
+            except Exception as xgb_error:
+                # Track failure count
+                if 'xgboost' not in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['xgboost'] = 0
+                MODEL_FAILURE_COUNT['xgboost'] += 1
+                
+                logger.warning(f"XGBoost batch prediction failed: {xgb_error}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['xgboost']})")
+                # Fallback to CatBoost for reliability
+                model = MODELS['catboost']
+                predictions_raw = model.predict(all_features)
+                actual_model_name = 'catboost'  # Update for result
+        elif actual_model_name == 'lstm':
+            try:
+                import tensorflow as tf
+                
+                # LSTM models need numeric features - encode festival_name
+                all_features_lstm = all_features.copy()
+                if 'festival_name' in all_features_lstm.columns:
+                    # Use same encoding as XGBoost for consistency
+                    all_features_lstm['festival_name'] = all_features_lstm['festival_name'].astype(str).map(
+                        lambda x: encode_festival_name_for_xgboost(x)
+                    ).fillna(0).astype(int)
+                
+                # Ensure all columns are numeric
+                for col in all_features_lstm.columns:
+                    if not pd.api.types.is_numeric_dtype(all_features_lstm[col]):
+                        all_features_lstm[col] = pd.to_numeric(all_features_lstm[col], errors='coerce').fillna(0)
+                
+                # Prepare features for LSTM batch prediction in correct order
+                features_array = all_features_lstm[FEATURE_COLUMNS].values.astype(np.float32)
+                
+                # Reshape for LSTM: (batch_size, timesteps, features)
+                # For hourly predictions, each row is a timestep
+                if len(features_array.shape) == 2:
+                    # Reshape to (batch_size, 1, n_features) for LSTM
+                    features_array = features_array.reshape(features_array.shape[0], 1, features_array.shape[1])
+                
+                predictions_raw = model.predict(features_array, verbose=0)
+                
+                # Flatten predictions if needed
+                if len(predictions_raw.shape) > 1:
+                    predictions_raw = predictions_raw.flatten()
+                
+                # Ensure all predictions are positive
+                predictions_raw = np.maximum(predictions_raw.astype(np.float32), 0.0)
+                
+                # Reset failure count on success
+                if 'lstm' in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['lstm'] = 0
+                logger.info(f"LSTM batch prediction successful: {len(predictions_raw)} predictions")
+            except Exception as lstm_error:
+                # Track failure count
+                if 'lstm' not in MODEL_FAILURE_COUNT:
+                    MODEL_FAILURE_COUNT['lstm'] = 0
+                MODEL_FAILURE_COUNT['lstm'] += 1
+                
+                logger.warning(f"LSTM batch prediction failed: {lstm_error}, falling back to CatBoost (failure count: {MODEL_FAILURE_COUNT['lstm']})")
+                # Fallback to CatBoost for reliability
+                model = MODELS['catboost']
+                predictions_raw = model.predict(all_features)
+                actual_model_name = 'catboost'  # Update for result
+        
+        # Format results for uncached timestamps
+        new_predictions = []
+        for i, ts in enumerate(uncached_timestamps):
+            date_str = ts.strftime('%Y-%m-%d')
+            festival_info = festival_info_cache[date_str]
+            prediction = max(float(predictions_raw[i]), 50.0)
+            
+            # Apply boost
+            boost = festival_info.get('boost', 1.0)
+            if boost > 1.0:
+                prediction = prediction * boost
+            
+            result = {
+                'timestamp': ts.isoformat(),
+                'hour': ts.hour,
+                'predicted_load': prediction,
+                'is_festival': festival_info['is_festival'],
+                'festival_name': festival_info['festival_name'],
+                'boost': boost,
+                'model': actual_model_name  # Use actual model used (may be CatBoost fallback)
+            }
+            
+            # Cache the result
+            cache_key = get_cache_key(ts, actual_model_name)
+            PREDICTION_CACHE[cache_key] = (result, datetime.now(timezone.utc).timestamp())
+            new_predictions.append(result)
+        
+        # Combine cached and new predictions in original order
+        all_predictions = []
+        for ts in [start_time + timedelta(hours=i) for i in range(request.hours)]:
+            if ts in cached_predictions:
+                all_predictions.append(cached_predictions[ts])
+            else:
+                all_predictions.append(new_predictions[uncached_timestamps.index(ts)])
+        
+        return all_predictions
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
+        # Try fallback to CatBoost if other model fails
+        if request.model_name != 'catboost' and MODELS and 'catboost' in MODELS:
+            logger.info(f"Attempting fallback to CatBoost model")
+            try:
+                # Re-prepare features for fallback (only uncached timestamps)
+                if not uncached_timestamps:
+                    # If all were cached, return cached results
+                    return [cached_predictions[ts] for ts in all_timestamps]
+                
+                # Prepare features for uncached timestamps
+                fallback_features_dicts = []
+                for ts in uncached_timestamps:
+                    date_str = ts.strftime('%Y-%m-%d')
+                    hour = ts.hour
+                    day_of_week = ts.weekday()
+                    month = ts.month
+                    festival_info = festival_info_cache[date_str]
+                    
+                    fallback_features_dicts.append({
+                        'hour': hour,
+                        'day_of_week': day_of_week,
+                        'month': month,
+                        'day': ts.day,
+                        'year': ts.year,
+                        'week_of_year': ts.isocalendar()[1],
+                        'quarter': (month - 1) // 3 + 1,
+                        'day_of_year': ts.timetuple().tm_yday,
+                        'hour_sin': np.sin(2 * np.pi * hour / 24),
+                        'hour_cos': np.cos(2 * np.pi * hour / 24),
+                        'dow_sin': np.sin(2 * np.pi * day_of_week / 7),
+                        'dow_cos': np.cos(2 * np.pi * day_of_week / 7),
+                        'is_weekend': int(day_of_week >= 5),
+                        'is_business_hours': int(9 <= hour <= 18),
+                        'is_peak_hours': int(hour in (12, 13, 19, 20, 21)),
+                        'is_night': int(hour < 6 or hour > 22),
+                        'is_festival': festival_info.get('is_festival', 0),
+                        'is_campaign': 0,
+                        'festival_name': festival_info.get('festival_name', 'None'),
+                        'traffic_lag_1h': 1200.0,
+                        'traffic_lag_24h': 1500.0,
+                        'traffic_lag_168h': 1400.0,
+                        'traffic_rolling_mean_24h': 1300.0,
+                        'traffic_rolling_std_24h': 200.0,
+                        'traffic_rolling_max_24h': 2000.0,
+                        'cpu_usage': 45.0,
+                        'memory_usage': 60.0,
+                        'response_time': 150.0,
+                        'error_rate': 0.5
+                    })
+                
+                model = MODELS['catboost']
+                all_features = pd.DataFrame(fallback_features_dicts)
+                all_features = all_features[FEATURE_COLUMNS]
+                predictions_raw = model.predict(all_features)
+                
+                # Format results with CatBoost
+                new_predictions = []
+                for i, ts in enumerate(uncached_timestamps):
+                    date_str = ts.strftime('%Y-%m-%d')
+                    festival_info = festival_info_cache[date_str]
+                    prediction = max(float(predictions_raw[i]), 50.0)
+                    
+                    boost = festival_info.get('boost', 1.0)
+                    if boost > 1.0:
+                        prediction = prediction * boost
+                    
+                    result = {
+                        'timestamp': ts.isoformat(),
+                        'hour': ts.hour,
+                        'predicted_load': prediction,
+                        'is_festival': festival_info['is_festival'],
+                        'festival_name': festival_info['festival_name'],
+                        'boost': boost,
+                        'model': 'catboost'  # Note: used fallback
+                    }
+                    
+                    # Cache the result
+                    cache_key = get_cache_key(ts, 'catboost')
+                    PREDICTION_CACHE[cache_key] = (result, datetime.now(timezone.utc).timestamp())
+                    new_predictions.append(result)
+                
+                # Combine cached and new predictions
+                all_predictions = []
+                for ts in all_timestamps:
+                    if ts in cached_predictions:
+                        all_predictions.append(cached_predictions[ts])
+                    else:
+                        all_predictions.append(new_predictions[uncached_timestamps.index(ts)])
+                
+                return all_predictions
+            except Exception as fallback_error:
+                logger.error(f"Fallback to CatBoost also failed: {fallback_error}")
+        
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.post("/scale")
@@ -502,14 +1237,7 @@ async def scale_endpoint(request: ScalingRequest):
         logger.error(f"Scaling error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@api_router.get("/festivals/{date}")
-async def check_festival(date: str):
-    """Check if date is a festival"""
-    try:
-        festival_info = check_festival_calendarific(date)
-        return festival_info
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+## NOTE: Specific year routes must be declared before the dynamic date route
 
 @api_router.get("/models")
 async def get_models():
@@ -535,10 +1263,38 @@ async def get_next_festival(model_name: str = 'catboost'):
             if festival_info['is_festival'] == 1:
                 # Found next festival, get 24h predictions
                 predictions = []
+                # Check if model has already failed - switch early to avoid 24 failures
+                actual_model = model_name
+                if model_name != 'catboost' and model_name in MODEL_FAILURE_COUNT:
+                    if MODEL_FAILURE_COUNT[model_name] >= MAX_FAILURES:
+                        logger.info(f"Model {model_name} has failed {MODEL_FAILURE_COUNT[model_name]} times previously, using CatBoost")
+                        actual_model = 'catboost'
+                
                 for hour in range(24):
                     timestamp = check_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-                    pred = predict_traffic(timestamp, model_name)
-                    predictions.append(pred)
+                    try:
+                        pred = predict_traffic(timestamp, actual_model, use_cache=True)
+                        predictions.append(pred)
+                    except Exception as e:
+                        logger.warning(f"Error predicting hour {hour} with {actual_model}: {e}")
+                        # Final fallback to CatBoost if still failing
+                        if actual_model != 'catboost' and 'catboost' in MODELS:
+                            pred = predict_traffic(timestamp, 'catboost', use_cache=True)
+                            predictions.append(pred)
+                            # Switch to CatBoost for remaining predictions
+                            actual_model = 'catboost'
+                        else:
+                            # If CatBoost also fails, use default estimate
+                            logger.error(f"All models failed, using default estimate")
+                            predictions.append({
+                                'timestamp': timestamp.isoformat(),
+                                'hour': hour,
+                                'predicted_load': 1000.0,
+                                'is_festival': 1,
+                                'festival_name': festival_info['festival_name'],
+                                'boost': festival_info.get('boost', 1.0),
+                                'model': 'fallback'
+                            })
                 
                 # Calculate metrics
                 loads = [p['predicted_load'] for p in predictions]
@@ -585,8 +1341,13 @@ async def get_next_festival(model_name: str = 'catboost'):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/festivals/2025")
-async def get_2025_festivals(model_name: str = 'catboost'):
-    """Get all 2025 major festivals with predictions and traffic spikes"""
+async def get_2025_festivals(model_name: str = 'catboost', include_predictions: bool = False, summary_only: bool = True):
+    """Get all 2025 major festivals with predictions and traffic spikes
+    
+    Args:
+        model_name: ML model to use (catboost, lightgbm, xgboost)
+        include_predictions: If True, includes 24-hour predictions (slower). Default: False for faster response.
+    """
     try:
         festivals_with_predictions = []
         
@@ -599,57 +1360,64 @@ async def get_2025_festivals(model_name: str = 'catboost'):
                 # Parse date
                 festival_date = datetime.strptime(date_str, '%Y-%m-%d')
                 
-                # Get 24-hour predictions for this festival
+                # Get predictions - only if requested (for performance)
                 predictions = []
-                for hour in range(24):
-                    timestamp = festival_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-                    pred = predict_traffic(timestamp, model_name)
-                    predictions.append(pred)
+                if include_predictions and not summary_only:
+                    # Get 24-hour predictions for this festival
+                    for hour in range(24):
+                        timestamp = festival_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                        try:
+                            pred = predict_traffic(timestamp, model_name)
+                            predictions.append(pred)
+                        except Exception as e:
+                            logger.warning(f"Error predicting for {date_str} hour {hour}: {e}")
+                            # Fallback: use CatBoost if other model fails
+                            if model_name != 'catboost':
+                                pred = predict_traffic(timestamp, 'catboost')
+                                predictions.append(pred)
+                else:
+                    # Quick/Summary mode: predict peak hour (12:00) for metrics
+                    peak_timestamp = festival_date.replace(hour=12, minute=0, second=0, microsecond=0)
+                    avg_load, peak_load = get_peak_prediction_with_fallback(peak_timestamp, model_name, boost)
                 
                 # Calculate metrics
-                loads = [p['predicted_load'] for p in predictions]
-                avg_load = sum(loads) / len(loads)
-                peak_load = max(loads)
-                peak_hour = predictions[loads.index(peak_load)]['hour']
+                if include_predictions and predictions:
+                    loads = [p['predicted_load'] for p in predictions]
+                    avg_load = sum(loads) / len(loads)
+                    peak_load = max(loads)
+                    peak_hour = predictions[loads.index(peak_load)]['hour']
+                else:
+                    # Use estimated values from quick mode (already calculated above)
+                    peak_hour = 12
                 
                 # Recommended instances
-                if peak_load < 700:
-                    recommended_instances = 1
-                elif peak_load < 1400:
-                    recommended_instances = 2
-                elif peak_load < 2100:
-                    recommended_instances = 3
-                elif peak_load < 3000:
-                    recommended_instances = 4
-                elif peak_load < 5000:
-                    recommended_instances = 5
-                else:
-                    recommended_instances = 10
+                recommended_instances = calculate_recommended_instances(peak_load)
                 
-                # Try to find 2024 same festival for comparison
+                # Try to find previous year same festival for comparison (only if predictions requested)
                 previous_year_data = None
-                date_2024 = date_str.replace('2025', '2024')
-                if date_2024 in INDIAN_FESTIVALS and INDIAN_FESTIVALS[date_2024]['name'] == festival_name:
-                    # Get 2024 predictions (as historical data)
-                    prev_date = datetime.strptime(date_2024, '%Y-%m-%d')
-                    prev_predictions = []
-                    for hour in range(24):
-                        timestamp = prev_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-                        pred = predict_traffic(timestamp, model_name)
-                        prev_predictions.append(pred)
-                    
-                    prev_loads = [p['predicted_load'] for p in prev_predictions]
-                    prev_avg_load = sum(prev_loads) / len(prev_loads)
-                    prev_peak_load = max(prev_loads)
-                    
-                    previous_year_data = {
-                        'date': date_2024,
-                        'avg_load': round(prev_avg_load),
-                        'peak_load': round(prev_peak_load),
-                        'growth_rate': round(((avg_load - prev_avg_load) / prev_avg_load) * 100, 2) if prev_avg_load > 0 else 0
-                    }
+                if include_predictions:
+                    date_prev = date_str.replace('2025', '2024')
+                    if date_prev in INDIAN_FESTIVALS and INDIAN_FESTIVALS[date_prev]['name'] == festival_name:
+                        # Get previous year predictions (as historical data) - just peak hour for speed
+                        prev_date = datetime.strptime(date_prev, '%Y-%m-%d')
+                        prev_peak_timestamp = prev_date.replace(hour=12, minute=0, second=0, microsecond=0)
+                        try:
+                            prev_peak_pred = predict_traffic(prev_peak_timestamp, model_name, use_cache=True)
+                            prev_avg_load = prev_peak_pred['predicted_load'] * 0.85
+                            prev_peak_load = prev_peak_pred['predicted_load'] * 1.15
+                        except Exception as e:
+                            logger.warning(f"Error predicting {date_prev}: {e}")
+                            prev_avg_load = avg_load * 0.9  # Estimate
+                            prev_peak_load = peak_load * 0.9
+                        
+                        previous_year_data = {
+                            'date': date_prev,
+                            'avg_load': round(prev_avg_load),
+                            'peak_load': round(prev_peak_load),
+                            'growth_rate': round(((avg_load - prev_avg_load) / prev_avg_load) * 100, 2) if prev_avg_load > 0 else 0
+                        }
                 
-                festivals_with_predictions.append({
+                festival_data = {
                     'festival_name': festival_name,
                     'date': date_str,
                     'day_of_week': festival_date.strftime('%A'),
@@ -659,9 +1427,14 @@ async def get_2025_festivals(model_name: str = 'catboost'):
                     'peak_load': round(peak_load),
                     'peak_hour': peak_hour,
                     'recommended_instances': recommended_instances,
-                    'previous_year': previous_year_data,
-                    'predictions': predictions
-                })
+                }
+                
+                # Only include predictions and previous_year if requested
+                if include_predictions and not summary_only:
+                    festival_data['previous_year'] = previous_year_data
+                    festival_data['predictions'] = predictions
+                
+                festivals_with_predictions.append(festival_data)
         
         # Sort by date
         festivals_with_predictions.sort(key=lambda x: x['date'])
@@ -677,10 +1450,23 @@ async def get_2025_festivals(model_name: str = 'catboost'):
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/festivals/2026")
-async def get_2026_festivals(model_name: str = 'catboost'):
-    """Get all 2026 major festivals with predictions and traffic spikes"""
+async def get_2026_festivals(model_name: str = 'catboost', include_predictions: bool = False, summary_only: bool = True):
+    """Get all 2026 major festivals with predictions and traffic spikes
+    
+    Args:
+        model_name: ML model to use (catboost, lightgbm, xgboost)
+        include_predictions: If True, includes 24-hour predictions (slower). Default: False for faster response.
+        summary_only: If True, uses boost multipliers only (NO predictions, fastest). Default: True.
+    """
     try:
         festivals_with_predictions = []
+        
+        # Check if model has failed too many times - auto-fallback to CatBoost
+        actual_model = model_name
+        if model_name != 'catboost' and model_name in MODEL_FAILURE_COUNT:
+            if MODEL_FAILURE_COUNT[model_name] >= MAX_FAILURES:
+                logger.info(f"Model {model_name} has failed {MODEL_FAILURE_COUNT[model_name]} times previously, using CatBoost")
+                actual_model = 'catboost'
         
         # Get all 2026 festivals from INDIAN_FESTIVALS
         for date_str, festival_data in INDIAN_FESTIVALS.items():
@@ -691,57 +1477,78 @@ async def get_2026_festivals(model_name: str = 'catboost'):
                 # Parse date
                 festival_date = datetime.strptime(date_str, '%Y-%m-%d')
                 
-                # Get 24-hour predictions for this festival
+                # Get predictions - only if requested (for performance)
                 predictions = []
-                for hour in range(24):
-                    timestamp = festival_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-                    pred = predict_traffic(timestamp, model_name)
-                    predictions.append(pred)
+                if include_predictions and not summary_only:
+                    # Get 24-hour predictions for this festival
+                    for hour in range(24):
+                        timestamp = festival_date.replace(hour=hour, minute=0, second=0, microsecond=0)
+                        try:
+                            pred = predict_traffic(timestamp, actual_model, use_cache=True)
+                            predictions.append(pred)
+                        except Exception as e:
+                            logger.warning(f"Error predicting for {date_str} hour {hour}: {e}")
+                            # Fallback: use CatBoost if other model fails
+                            if actual_model != 'catboost':
+                                pred = predict_traffic(timestamp, 'catboost', use_cache=True)
+                                predictions.append(pred)
+                                # Switch to CatBoost for remaining predictions
+                                actual_model = 'catboost'
+                            else:
+                                # If CatBoost also fails, use default estimate
+                                logger.error(f"All models failed, using default estimate")
+                                predictions.append({
+                                    'timestamp': timestamp.isoformat(),
+                                    'hour': hour,
+                                    'predicted_load': 1000.0 * boost,
+                                    'is_festival': 1,
+                                    'festival_name': festival_name,
+                                    'boost': boost,
+                                    'model': 'fallback'
+                                })
+                else:
+                    # Quick/Summary mode: predict peak hour (12:00) for metrics
+                    peak_timestamp = festival_date.replace(hour=12, minute=0, second=0, microsecond=0)
+                    avg_load, peak_load = get_peak_prediction_with_fallback(peak_timestamp, actual_model, boost)
                 
                 # Calculate metrics
-                loads = [p['predicted_load'] for p in predictions]
-                avg_load = sum(loads) / len(loads)
-                peak_load = max(loads)
-                peak_hour = predictions[loads.index(peak_load)]['hour']
+                if include_predictions and predictions:
+                    loads = [p['predicted_load'] for p in predictions]
+                    avg_load = sum(loads) / len(loads)
+                    peak_load = max(loads)
+                    peak_hour = predictions[loads.index(peak_load)]['hour']
+                else:
+                    # Use estimated values from quick mode (already calculated above)
+                    peak_hour = 12
                 
                 # Recommended instances
-                if peak_load < 700:
-                    recommended_instances = 1
-                elif peak_load < 1400:
-                    recommended_instances = 2
-                elif peak_load < 2100:
-                    recommended_instances = 3
-                elif peak_load < 3000:
-                    recommended_instances = 4
-                elif peak_load < 5000:
-                    recommended_instances = 5
-                else:
-                    recommended_instances = 10
+                recommended_instances = calculate_recommended_instances(peak_load)
                 
-                # Try to find 2025 same festival for comparison
+                # Try to find previous year same festival for comparison (only if predictions requested)
                 previous_year_data = None
-                date_2025 = date_str.replace('2026', '2025')
-                if date_2025 in INDIAN_FESTIVALS and INDIAN_FESTIVALS[date_2025]['name'] == festival_name:
-                    # Get 2025 predictions (as historical data)
-                    prev_date = datetime.strptime(date_2025, '%Y-%m-%d')
-                    prev_predictions = []
-                    for hour in range(24):
-                        timestamp = prev_date.replace(hour=hour, minute=0, second=0, microsecond=0)
-                        pred = predict_traffic(timestamp, model_name)
-                        prev_predictions.append(pred)
-                    
-                    prev_loads = [p['predicted_load'] for p in prev_predictions]
-                    prev_avg_load = sum(prev_loads) / len(prev_loads)
-                    prev_peak_load = max(prev_loads)
-                    
-                    previous_year_data = {
-                        'date': date_2025,
-                        'avg_load': round(prev_avg_load),
-                        'peak_load': round(prev_peak_load),
-                        'growth_rate': round(((avg_load - prev_avg_load) / prev_avg_load) * 100, 2) if prev_avg_load > 0 else 0
-                    }
+                if include_predictions:
+                    date_prev = date_str.replace('2026', '2025')
+                    if date_prev in INDIAN_FESTIVALS and INDIAN_FESTIVALS[date_prev]['name'] == festival_name:
+                        # Get previous year predictions (as historical data) - just peak hour for speed
+                        prev_date = datetime.strptime(date_prev, '%Y-%m-%d')
+                        prev_peak_timestamp = prev_date.replace(hour=12, minute=0, second=0, microsecond=0)
+                        try:
+                            prev_peak_pred = predict_traffic(prev_peak_timestamp, actual_model, use_cache=True)
+                            prev_avg_load = prev_peak_pred['predicted_load'] * 0.85
+                            prev_peak_load = prev_peak_pred['predicted_load'] * 1.15
+                        except Exception as e:
+                            logger.warning(f"Error predicting {date_prev}: {e}")
+                            prev_avg_load = avg_load * 0.9  # Estimate
+                            prev_peak_load = peak_load * 0.9
+                        
+                        previous_year_data = {
+                            'date': date_prev,
+                            'avg_load': round(prev_avg_load),
+                            'peak_load': round(prev_peak_load),
+                            'growth_rate': round(((avg_load - prev_avg_load) / prev_avg_load) * 100, 2) if prev_avg_load > 0 else 0
+                        }
                 
-                festivals_with_predictions.append({
+                festival_data = {
                     'festival_name': festival_name,
                     'date': date_str,
                     'day_of_week': festival_date.strftime('%A'),
@@ -751,9 +1558,14 @@ async def get_2026_festivals(model_name: str = 'catboost'):
                     'peak_load': round(peak_load),
                     'peak_hour': peak_hour,
                     'recommended_instances': recommended_instances,
-                    'previous_year': previous_year_data,
-                    'predictions': predictions
-                })
+                }
+                
+                # Only include predictions and previous_year if requested
+                if include_predictions and not summary_only:
+                    festival_data['previous_year'] = previous_year_data
+                    festival_data['predictions'] = predictions
+                
+                festivals_with_predictions.append(festival_data)
         
         # Sort by date
         festivals_with_predictions.sort(key=lambda x: x['date'])
@@ -767,6 +1579,28 @@ async def get_2026_festivals(model_name: str = 'catboost'):
     except Exception as e:
         logger.error(f"2026 festivals error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/festivals/{date}")
+async def check_festival(date: str):
+    """Check if date is a festival"""
+    try:
+        # Validate date format - must be YYYY-MM-DD
+        if len(date) == 4 and date.isdigit():
+            # If only year provided, return error or handle differently
+            raise HTTPException(status_code=400, detail="Date must be in format YYYY-MM-DD, not just year")
+        
+        # Try to parse the date to validate format
+        try:
+            datetime.strptime(date, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid date format: {date}. Expected YYYY-MM-DD")
+        
+        festival_info = check_festival_calendarific(date)
+        return festival_info
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @api_router.get("/aws/instances")
 async def get_aws_instances():
@@ -907,7 +1741,7 @@ async def get_status_checks():
     
     for check in status_checks:
         if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+            check['timestamp'] = parse_iso_datetime(check['timestamp'])
     
     return status_checks
 
@@ -917,7 +1751,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )

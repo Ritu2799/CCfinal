@@ -14,7 +14,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { format } from 'date-fns';
 import FestivalCalendar from '@/components/FestivalCalendar';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
 const API = `${BACKEND_URL}/api`;
 
 function App() {
@@ -59,6 +59,8 @@ function App() {
         start_time: predictDate.toISOString(),
         hours: 24,
         model_name: modelName
+      }, {
+        timeout: 60000 // 60 second timeout for model predictions
       });
       
       const data = response.data;
@@ -85,7 +87,10 @@ function App() {
       toast.success(`Predictions loaded for ${format(predictDate, 'MMM dd, yyyy')} with ${modelName.toUpperCase()}`);
     } catch (error) {
       console.error('Error fetching predictions:', error);
-      toast.error('Failed to fetch predictions');
+      const errorMessage = error.response?.data?.detail || error.message || 'Failed to fetch predictions';
+      toast.error(`Failed to fetch predictions: ${errorMessage}`);
+      console.error('Full error:', error);
+      console.error('Backend URL:', API);
     } finally {
       setLoading(false);
     }

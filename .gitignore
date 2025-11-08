@@ -31,7 +31,12 @@ dist/
 dist
 
 # Environment files (comprehensive coverage)
-
+.env
+.env.local
+.env.*.local
+*.env
+backend/.env
+frontend/.env
 *token.json*
 *credentials.json*
 
@@ -41,16 +46,38 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 dump.rdb
+*.log
+backend_server.log
+frontend_dev.log
+backend/training_output.log
+backend/*.log
 
 # System files
 .DS_Store
 *.pem
+*.key
+global-bundle.pem
+*.pem
+*.ppk
+
+# MongoDB/DocumentDB certificates
+*.pem
+certs/
 
 # Python
 __pycache__/
 *pyc*
 venv/
 .venv/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Development tools
 chainlit.md

@@ -7,7 +7,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Calendar, TrendingUp, Activity, Server, Sparkles } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000';
 const API = `${BACKEND_URL}/api`;
 
 const FestivalCalendar = ({ selectedModel }) => {
@@ -24,7 +24,11 @@ const FestivalCalendar = ({ selectedModel }) => {
     setLoading(true);
     try {
       const response = await axios.get(`${API}/festivals/${yr}`, {
-        params: { model_name: selectedModel }
+        params: { 
+          model_name: selectedModel,
+          include_predictions: false, // Fast mode - set to true for detailed 24h predictions
+          summary_only: true // Ultra-fast mode - no predictions, just estimates from boost
+        }
       });
       setFestivals(response.data.festivals || []);
     } catch (error) {
