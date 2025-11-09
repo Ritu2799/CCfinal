@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stress-client-script
+data:
+  stress.js: |
+    const http = require('http');
+    
+    const SERVICE_URL = process.env.SERVICE_URL || 'orders';
+    const SERVICE_PORT = process.env.SERVICE_PORT || '4001';
+    const ENDPOINT = process.env.ENDPOINT || '/metrics';
+    const CONCURRENT = parseInt(process.env.CONCURRENT || '50');
+    const DURATION = parseInt(process.env.DURATION || '300'); // 5 minutes default
+    
+    let successCount = 0;
+    let errorCount = 0;
+    let totalRequests = 0;
+    
+    console.log(`Starting stress test...`);
+    console.log(`Target: http://${SERVICE_URL}:${SERVICE_PORT}${ENDPOINT}`);
+    console.log(`Concurrent requests: ${CONCURRENT}`);
+    console.log(`Duration: ${DURATION} seconds`);
+    console.log('---');
+    
+    const makeRequest = () => {
+      const startTime = Date.now();
+      
+      const options = {
+        hostname: SERVICE_URL,
+        port: SERVICE_PORT,
+        path: ENDPOINT,
+        method: 'GET',
+        timeout: 5000
+      };
+      
+      const req = http.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          successCount++;
+          totalRequests++;
+          const duration = Date.now() - startTime;
+          if (totalRequests % 100 === 0) {
+            console.log(`Requests: ${totalRequests}, Success: ${successCount}, Errors: ${errorCount}, Last: ${duration}ms`);
+          }
+        });
+      });
+      
+      req.on('error', (err) => {
+        errorCount++;
+        totalRequests++;
+        console.error(`Error: ${err.message}`);
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+        errorCount++;
+        totalRequests++;
+        console.error('Request timeout');
+      });
+      
+      req.end();
+    };
+    
+    // Send requests continuously
+    const startTime = Date.now();
+    const interval = setInterval(() => {
+      for (let i = 0; i < CONCURRENT; i++) {
+        makeRequest();
+      }
+      
+      // Check if duration exceeded
+      if ((Date.now() - startTime) / 1000 > DURATION) {
+        clearInterval(interval);
+        console.log('\n--- Test Complete ---');
+        console.log(`Total Requests: ${totalRequests}`);
+        console.log(`Successful: ${successCount}`);
+        console.log(`Errors: ${errorCount}`);
+        console.log(`Success Rate: ${((successCount / totalRequests) * 100).toFixed(2)}%`);
+        process.exit(0);
+      }
+    }, 100); // Send batch every 100ms
+    
+    // Print stats every 10 seconds
+    setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const rps = Math.floor(totalRequests / elapsed);
+      console.log(`\n[${elapsed}s] RPS: ${rps}, Total: ${totalRequests}, Success: ${successCount}, Errors: ${errorCount}`);
+    }, 10000);

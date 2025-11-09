@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: riteshb121/backend
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            # No limits - pods can use more if needed
+          env:
+            - name: GEMINI_API_KEY
+              value: "AIzaSyBQ1sEV-WMcXbuBdStmauCuYFv-XyBowCk"
+            # Database Configuration
+            - name: MONGO_URL
+              value: "mongodb://admin:secret@mongo:27017/appdb"
+            - name: DB_NAME
+              value: "autoscaling_db"
+            # Server Configuration
+            - name: PORT
+              value: "8000"
+            - name: HOST
+              value: "127.0.0.1"
+            # Feature Flags
+            - name: ENABLE_MOCK_MODE
+              value: "false"
+            - name: ENABLE_CACHING
+              value: "true"
