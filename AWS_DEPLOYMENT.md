@@ -141,13 +141,35 @@ sudo apt install build-essential -y
 
 ### Step 5: Deploy Backend Code
 
+**⚠️ IMPORTANT: Model Files Required**
+
+Your backend **MUST** include these ML model files in the `backend/` directory:
+- `catboost_hourly_model.pkl` (required)
+- `lightgbm_hourly_model.pkl` (required)
+- `xgboost_hourly_model.pkl` (required)
+- `feature_columns_hourly.pkl` (required)
+- `lstm_hourly_model_fixed.h5` (optional, but recommended)
+- `lstm_hourly_model.h5` (optional, fallback)
+
+**Without these files, your backend will not work!** The server loads these models at startup.
+
 ```bash
 # Clone your repository (or upload files)
 git clone https://github.com/your-username/your-repo.git
 cd your-repo/backend
 
+# Verify model files are present
+ls -la *.pkl *.h5
+# You should see:
+# - catboost_hourly_model.pkl
+# - lightgbm_hourly_model.pkl
+# - xgboost_hourly_model.pkl
+# - feature_columns_hourly.pkl
+# - lstm_hourly_model_fixed.h5 (optional)
+
 # OR: Upload files using SCP from local machine
 # scp -r -i your-key.pem backend/ ubuntu@your-ec2-ip:~/
+# This will upload all files including model files
 
 # Create virtual environment
 python3 -m venv .venv
@@ -703,12 +725,14 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-c
 
 ### Backend Deployment
 - [ ] Backend code deployed to EC2
+- [ ] **Model files uploaded** (catboost_hourly_model.pkl, lightgbm_hourly_model.pkl, xgboost_hourly_model.pkl, feature_columns_hourly.pkl, lstm_hourly_model_fixed.h5)
 - [ ] Dependencies installed
 - [ ] Systemd service configured and running
 - [ ] Nginx reverse proxy configured
 - [ ] SSL certificate installed
 - [ ] Health endpoint responding
 - [ ] API endpoints tested
+- [ ] Predictions endpoint working (verifies models are loaded)
 
 ### Frontend Deployment
 - [ ] Frontend built for production

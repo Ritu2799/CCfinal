@@ -54,14 +54,12 @@ backend/*.log
 
 # System files
 .DS_Store
-*.pem
-*.key
-global-bundle.pem
+
+# Certificates and keys (security - never commit these!)
 *.pem
 *.ppk
-
-# MongoDB/DocumentDB certificates
-*.pem
+*.key
+global-bundle.pem
 certs/
 
 # Python
@@ -104,5 +102,26 @@ agenthub/agents/youtube/db
 .cache/
 
 # Mobile development
-android-sdk/ frontend/node_modules/.cache/default-development/0.pack
+android-sdk/
 frontend/node_modules/.cache/default-development/0.pack
+
+# Training and testing files (not needed for production)
+backend/fix_lstm_model.py
+backend/generate_sample_training_data.py
+backend/reconstruct_lstm.py
+backend/test_models.py
+backend/train_xgboost_lightgbm.py
+backend/predictions_sample_24h.csv
+backend/traffic_hourly_dataset.csv
+backend/TEST_RESULTS.md
+backend/TRAINING_SUCCESS.md
+backend/README.md
+backend/lstm_hourly_model.h5
+
+# Keep these model files (REQUIRED for production):
+# backend/catboost_hourly_model.pkl
+# backend/lightgbm_hourly_model.pkl
+# backend/xgboost_hourly_model.pkl
+# backend/feature_columns_hourly.pkl
+# backend/lstm_hourly_model_fixed.h5
+

@@ -1,7 +1,6 @@
 from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import warnings
@@ -20,10 +19,42 @@ from botocore.exceptions import ClientError, NoCredentialsError
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# MongoDB connection (optional - graceful handling)
+# Try to import Motor, but don't fail if it's not available or has compatibility issues
+mongo_url = os.environ.get('MONGO_URL', '')
+db_name = os.environ.get('DB_NAME', 'autoscaling_db')
+client = None
+db = None
+MOTOR_AVAILABLE = False
+
+try:
+    from motor.motor_asyncio import AsyncIOMotorClient
+    MOTOR_AVAILABLE = True
+    
+    if mongo_url:
+        try:
+            client = AsyncIOMotorClient(mongo_url)
+            db = client[db_name]
+            logger.info("✅ MongoDB connected successfully")
+        except Exception as e:
+            logger.warning(f"⚠️ MongoDB connection failed: {e}. Status checks will be disabled.")
+            client = None
+            db = None
+    else:
+        logger.info("ℹ️ MONGO_URL not set. Status checks will be disabled.")
+except ImportError as e:
+    logger.warning(f"⚠️ Motor (MongoDB driver) not available: {e}. Status checks will be disabled.")
+    logger.info("ℹ️ To enable MongoDB features, install compatible versions: pip install 'motor>=3.3.0' 'pymongo>=4.0,<5.0'")
+except Exception as e:
+    logger.warning(f"⚠️ Error loading Motor: {e}. Status checks will be disabled.")
+    logger.info("ℹ️ MongoDB features are optional. The server will continue without them.")
 
 # Create the main app without a prefix
 app = FastAPI(title="AI Predictive Autoscaling System")
@@ -251,6 +282,97 @@ except Exception as e:
     logger.error(f"❌ Error loading models: {e}")
     MODELS = None
     FEATURE_COLUMNS = None
+
+# ============================================================================
+# GEMINI API INTEGRATION FOR PREDICTION REASONING
+# ============================================================================
+
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent'
+
+def generate_prediction_reasoning(prediction_data: Dict[str, Any]) -> str:
+    """Generate AI reasoning for a prediction using Gemini API"""
+    if not GEMINI_API_KEY:
+        return ""  # Return empty if API key not configured
+    
+    try:
+        # Prepare context for Gemini
+        timestamp = prediction_data.get('timestamp', '')
+        hour = prediction_data.get('hour', 0)
+        predicted_load = prediction_data.get('predicted_load', 0)
+        is_festival = prediction_data.get('is_festival', 0)
+        festival_name = prediction_data.get('festival_name', 'None')
+        boost = prediction_data.get('boost', 1.0)
+        model = prediction_data.get('model', 'catboost')
+        
+        # Determine time of day
+        if 6 <= hour < 12:
+            time_period = "morning"
+        elif 12 <= hour < 18:
+            time_period = "afternoon"
+        elif 18 <= hour < 22:
+            time_period = "evening"
+        else:
+            time_period = "night"
+        
+        # Determine day of week
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            day_name = dt.strftime('%A')
+            is_weekend = dt.weekday() >= 5
+        except:
+            day_name = "day"
+            is_weekend = False
+        
+        # Build prompt
+        prompt = f"""Analyze this traffic prediction and provide a brief, clear reasoning (2-3 sentences max):
+
+Prediction Details:
+- Time: {day_name} {time_period} (Hour {hour}:00)
+- Predicted Traffic Load: {predicted_load:.0f} requests/hour
+- Model Used: {model}
+- Festival: {"Yes" if is_festival else "No"} ({festival_name})
+- Festival Boost: {boost}x
+
+Provide reasoning explaining:
+1. Why the traffic is at this level for this time/day
+2. Impact of festival (if applicable)
+3. Expected user behavior patterns
+
+Keep it concise and technical."""
+        
+        # Call Gemini API
+        headers = {
+            'Content-Type': 'application/json',
+        }
+        
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": prompt
+                }]
+            }]
+        }
+        
+        response = requests.post(
+            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            headers=headers,
+            json=payload,
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if 'candidates' in result and len(result['candidates']) > 0:
+                reasoning = result['candidates'][0]['content']['parts'][0]['text']
+                return reasoning.strip()
+        
+        logger.warning(f"Gemini API returned status {response.status_code}")
+        return ""
+        
+    except Exception as e:
+        logger.debug(f"Gemini API error: {e}")
+        return ""  # Return empty on error - don't break predictions
 
 # ============================================================================
 # CALENDARIFIC API INTEGRATION
@@ -786,8 +908,17 @@ def predict_traffic(timestamp: datetime, model_name: str = 'catboost', use_cache
         'is_festival': festival_info['is_festival'],
         'festival_name': festival_info['festival_name'],
         'boost': boost,
-        'model': model_name
+        'model': model_name,
+        'reasoning': ''  # Will be filled below
     }
+    
+    # Generate AI reasoning for single prediction
+    try:
+        reasoning = generate_prediction_reasoning(result)
+        result['reasoning'] = reasoning
+    except Exception as e:
+        logger.debug(f"Failed to generate reasoning: {e}")
+        result['reasoning'] = ""
     
     # Cache the result
     if use_cache:
@@ -812,6 +943,7 @@ class PredictionResponse(BaseModel):
     is_festival: int
     festival_name: str
     model: str
+    reasoning: str = ""  # AI-generated reasoning for the prediction
 
 class ScalingRequest(BaseModel):
     predicted_load: float
@@ -842,12 +974,16 @@ async def root():
 @api_router.get("/health")
 async def health_check():
     aws_configured = bool(os.environ.get('AWS_ACCESS_KEY_ID') and os.environ.get('AWS_SECRET_ACCESS_KEY'))
+    gemini_configured = bool(GEMINI_API_KEY)
+    mongo_configured = bool(client and db)
     return {
         "status": "healthy",
         "models_loaded": MODELS is not None,
         "feature_columns": len(FEATURE_COLUMNS) if FEATURE_COLUMNS else 0,
         "aws_configured": aws_configured,
         "aws_region": os.environ.get('AWS_REGION', 'not-set'),
+        "gemini_configured": gemini_configured,
+        "mongo_configured": mongo_configured,
         "total_festivals_2025": len([k for k in HARDCODED_FESTIVALS.keys() if k.startswith('2025')])
     }
 
@@ -1112,8 +1248,17 @@ async def predict_endpoint(request: PredictionRequest):
                 'is_festival': festival_info['is_festival'],
                 'festival_name': festival_info['festival_name'],
                 'boost': boost,
-                'model': actual_model_name  # Use actual model used (may be CatBoost fallback)
+                'model': actual_model_name,  # Use actual model used (may be CatBoost fallback)
+                'reasoning': ''  # Will be generated below
             }
+            
+            # Generate AI reasoning using Gemini (async, non-blocking)
+            try:
+                reasoning = generate_prediction_reasoning(result)
+                result['reasoning'] = reasoning
+            except Exception as e:
+                logger.debug(f"Failed to generate reasoning: {e}")
+                result['reasoning'] = ""
             
             # Cache the result
             cache_key = get_cache_key(ts, actual_model_name)
@@ -1121,10 +1266,19 @@ async def predict_endpoint(request: PredictionRequest):
             new_predictions.append(result)
         
         # Combine cached and new predictions in original order
+        # Add reasoning to cached predictions if missing
         all_predictions = []
         for ts in [start_time + timedelta(hours=i) for i in range(request.hours)]:
             if ts in cached_predictions:
-                all_predictions.append(cached_predictions[ts])
+                pred = cached_predictions[ts]
+                # Add reasoning to cached predictions if missing
+                if not pred.get('reasoning'):
+                    try:
+                        reasoning = generate_prediction_reasoning(pred)
+                        pred['reasoning'] = reasoning
+                    except:
+                        pred['reasoning'] = ""
+                all_predictions.append(pred)
             else:
                 all_predictions.append(new_predictions[uncached_timestamps.index(ts)])
         
@@ -1205,8 +1359,17 @@ async def predict_endpoint(request: PredictionRequest):
                         'is_festival': festival_info['is_festival'],
                         'festival_name': festival_info['festival_name'],
                         'boost': boost,
-                        'model': 'catboost'  # Note: used fallback
+                        'model': 'catboost',  # Note: used fallback
+                        'reasoning': ''  # Will be generated
                     }
+                    
+                    # Generate AI reasoning
+                    try:
+                        reasoning = generate_prediction_reasoning(result)
+                        result['reasoning'] = reasoning
+                    except Exception as e:
+                        logger.debug(f"Failed to generate reasoning: {e}")
+                        result['reasoning'] = ""
                     
                     # Cache the result
                     cache_key = get_cache_key(ts, 'catboost')
@@ -1214,10 +1377,19 @@ async def predict_endpoint(request: PredictionRequest):
                     new_predictions.append(result)
                 
                 # Combine cached and new predictions
+                # Add reasoning to cached predictions if missing
                 all_predictions = []
                 for ts in all_timestamps:
                     if ts in cached_predictions:
-                        all_predictions.append(cached_predictions[ts])
+                        pred = cached_predictions[ts]
+                        # Add reasoning to cached predictions if missing
+                        if not pred.get('reasoning'):
+                            try:
+                                reasoning = generate_prediction_reasoning(pred)
+                                pred['reasoning'] = reasoning
+                            except:
+                                pred['reasoning'] = ""
+                        all_predictions.append(pred)
                     else:
                         all_predictions.append(new_predictions[uncached_timestamps.index(ts)])
                 
@@ -1235,6 +1407,78 @@ async def scale_endpoint(request: ScalingRequest):
         return result
     except Exception as e:
         logger.error(f"Scaling error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ReasonRequest(BaseModel):
+    prompt: str | None = None
+    context: Dict[str, Any] | None = None
+
+
+@api_router.post("/reason")
+async def reason_endpoint(request: ReasonRequest):
+    """Return reasoning for a recommendation. If GEMINI_API_KEY and GEMINI_API_URL
+    are set, proxy the prompt to that endpoint. Otherwise return a safe local
+    explanation built from the provided context.
+    """
+    gemini_key = os.environ.get('GEMINI_API_KEY', '')
+    gemini_url = os.environ.get('GEMINI_API_URL', GEMINI_API_URL)
+
+    # Build prompt when not provided
+    prompt = request.prompt
+    ctx = request.context or {}
+    if not prompt:
+        prompt = (
+            f"Explain the autoscaling recommendation.\n"
+            f"Model: {ctx.get('model','unknown')}\n"
+            f"Peak load: {ctx.get('peakLoad', ctx.get('peak_load','unknown'))}\n"
+            f"Recommended instances: {ctx.get('recommendedInstances', ctx.get('recommended_instances','unknown'))}\n"
+            f"Date: {ctx.get('date','unknown')}\n"
+            "Provide a concise, actionable explanation and safety considerations."
+        )
+
+    # Try remote Gemini service first
+    if gemini_key and gemini_url:
+        try:
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            payload = { 'input': prompt }
+            resp = requests.post(f"{gemini_url}?key={gemini_key}", headers=headers, json=payload, timeout=20)
+            resp.raise_for_status()
+            try:
+                body = resp.json()
+            except Exception:
+                body = { 'raw': resp.text }
+
+            return {
+                'mode': 'remote',
+                'provider_response': body
+            }
+        except Exception as e:
+            logger.warning(f"Gemini proxy failed: {e}, falling back to local explanation")
+
+    # Local deterministic fallback
+    try:
+        peak = ctx.get('peakLoad') or ctx.get('peak_load') or 'unknown'
+        rec = ctx.get('recommendedInstances') or ctx.get('recommended_instances') or 'unknown'
+        model = ctx.get('model', 'the configured model')
+
+        explanation = (
+            f"Recommendation summary:\n"
+            f"- Based on {model}, the predicted peak load is {peak}.\n"
+            f"- The autoscaler recommends {rec} instance(s) to meet expected demand while maintaining safety margins.\n"
+            "Why:\n"
+            "1) The predicted request rate requires capacity to avoid increased latency and errors.\n"
+            "2) The autoscaler enforces cooldowns and min/max caps to prevent flapping.\n"
+            "Actions:\n"
+            "- Approve the scale action and monitor metrics for 15–30 minutes.\n"
+            "- If the spike is unexpected, investigate traffic sources and roll back if necessary."
+        )
+
+        return { 'mode': 'local', 'explanation': explanation }
+    except Exception as e:
+        logger.exception('Failed to build explanation')
         raise HTTPException(status_code=500, detail=str(e))
 
 ## NOTE: Specific year routes must be declared before the dynamic date route
@@ -1726,6 +1970,19 @@ async def update_aws_instance(instance_id: str, action: str):
 # Original routes
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
+    """Create a status check (requires MongoDB)"""
+    if not MOTOR_AVAILABLE:
+        raise HTTPException(
+            status_code=503, 
+            detail="MongoDB driver (Motor) not available. Install with: pip install 'motor>=3.3.0' 'pymongo>=4.0,<5.0'"
+        )
+    
+    if not db:
+        raise HTTPException(
+            status_code=503, 
+            detail="MongoDB not configured. Please set MONGO_URL in environment variables."
+        )
+    
     status_dict = input.model_dump()
     status_obj = StatusCheck(**status_dict)
     
@@ -1737,6 +1994,10 @@ async def create_status_check(input: StatusCheckCreate):
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
+    """Get status checks (requires MongoDB)"""
+    if not MOTOR_AVAILABLE or not db:
+        return []  # Return empty list if MongoDB not available or not configured
+    
     status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
     
     for check in status_checks:
@@ -1758,4 +2019,5 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client:
+        client.close()

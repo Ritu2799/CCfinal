@@ -23,6 +23,8 @@ function App() {
   const [activeTab, setActiveTab] = useState('predictions');
   const [loading, setLoading] = useState(false);
   const [scalingResult, setScalingResult] = useState(null);
+  const [reasonLoading, setReasonLoading] = useState(false);
+  const [reasonText, setReasonText] = useState('');
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [nextFestival, setNextFestival] = useState(null);
@@ -120,6 +122,60 @@ function App() {
     } catch (error) {
       console.error('Error triggering scaling:', error);
       toast.error('Failed to trigger scaling');
+    }
+  };
+
+  // Request explanation / reasoning from backend (Gemini proxy or local fallback)
+  const requestReasoning = async () => {
+    if (!currentMetrics || !currentMetrics.peakLoad) {
+      toast.error('No metrics available to explain');
+      return;
+    }
+
+    setReasonLoading(true);
+    setReasonText('');
+    try {
+      const payload = {
+        context: {
+          peakLoad: currentMetrics.peakLoad,
+          recommendedInstances: currentMetrics.recommendedInstances,
+          model: selectedModel,
+          date: selectedDate.toISOString()
+        }
+      };
+
+      const resp = await axios.post(`${API}/reason`, payload, { timeout: 20000 });
+      const data = resp.data;
+
+      if (data.mode === 'remote') {
+        // Try to extract a human-readable message from provider response
+        if (data.provider_response && typeof data.provider_response === 'object') {
+          // Heuristics: some providers return {candidates: [{content:{parts:[{text}]}}]}
+          try {
+            const cand = data.provider_response.candidates?.[0];
+            const text = cand?.content?.parts?.[0]?.text;
+            if (text) {
+              setReasonText(text);
+            } else {
+              setReasonText(JSON.stringify(data.provider_response));
+            }
+          } catch (e) {
+            setReasonText(JSON.stringify(data.provider_response));
+          }
+        } else {
+          setReasonText(String(data.provider_response || 'No remote response'));
+        }
+      } else if (data.mode === 'local') {
+        setReasonText(data.explanation || 'No explanation returned');
+      } else {
+        setReasonText(JSON.stringify(data));
+      }
+
+    } catch (error) {
+      console.error('Error requesting reasoning:', error);
+      toast.error('Failed to get explanation');
+    } finally {
+      setReasonLoading(false);
     }
   };
 
@@ -413,6 +469,16 @@ function App() {
                 <Server className="button-icon" />
                 Trigger AWS Scaling
               </Button>
+              <Button
+                onClick={requestReasoning}
+                disabled={reasonLoading || !currentMetrics || currentMetrics.peakLoad === 0}
+                variant="outline"
+                className="explain-button"
+                data-testid="explain-recommendation-btn"
+                style={{ marginLeft: '0.5rem' }}
+              >
+                {reasonLoading ? 'Thinking...' : 'Explain Recommendation'}
+              </Button>
               
               {scalingResult && (
                 <div className="scaling-result" data-testid="scaling-result">
@@ -434,6 +500,21 @@ function App() {
                     </div>
                     <p className="result-message">{scalingResult.message}</p>
                   </div>
+                </div>
+              )}
+
+              {/* Explanation / Reasoning */}
+              {reasonText && (
+                <div className="reasoning-block" data-testid="reasoning-block" style={{ marginTop: '1rem' }}>
+                  <Card>
+                    <CardHeader>
+                      <CardTitle>Explanation</CardTitle>
+                      <CardDescription>Why the autoscaler recommended this capacity</CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{reasonText}</pre>
+                    </CardContent>
+                  </Card>
                 </div>
               )}
             </CardContent>

@@ -1,0 +1,49 @@
+# Python.venv
+
+__pycache__/venv
+
+*.py[cod]__pycache__/
+
+*$py.class*.pyc
+
+.Python*.so
+
+.env*.dylib
+
+.venv/*.egg-info
+
+venv/.environment
+
+ENV/.env
+
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML Models
+*.h5
+*.pkl
+*.pt
+*.pth
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+*.egg-info/

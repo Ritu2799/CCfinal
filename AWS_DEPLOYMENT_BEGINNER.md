@@ -3,6 +3,7 @@
 **Step-by-step guide to deploy your AI Predictive Autoscaling System on AWS - No prior AWS knowledge required!**
 
 ---
+mongodb+srv://admin:<Ritesh2799>@cluster0.oevwtkc.mongodb.net/
 
 ## 📚 Table of Contents
 
@@ -658,7 +659,16 @@ git clone https://github.com/your-username/your-repo-name.git
 # Navigate to backend directory
 cd your-repo-name/backend
 
-# List files to verify
+# ⚠️ IMPORTANT: Verify model files are present
+ls -la *.pkl *.h5
+# You should see:
+# - catboost_hourly_model.pkl (REQUIRED)
+# - lightgbm_hourly_model.pkl (REQUIRED)
+# - xgboost_hourly_model.pkl (REQUIRED)
+# - feature_columns_hourly.pkl (REQUIRED)
+# - lstm_hourly_model_fixed.h5 (optional)
+
+# List all files to verify
 ls -la
 ```
 
@@ -670,10 +680,20 @@ ls -la
 # Navigate to your project directory
 cd /path/to/your/project
 
-# Upload backend folder to EC2
+# ⚠️ IMPORTANT: Verify model files exist locally first
+ls -la backend/*.pkl backend/*.h5
+# Make sure you see:
+# - catboost_hourly_model.pkl (REQUIRED)
+# - lightgbm_hourly_model.pkl (REQUIRED)
+# - xgboost_hourly_model.pkl (REQUIRED)
+# - feature_columns_hourly.pkl (REQUIRED)
+# - lstm_hourly_model_fixed.h5 (optional)
+
+# Upload backend folder to EC2 (includes all model files)
 scp -i ~/.ssh/autoscaling-backend-key.pem -r backend/ ubuntu@YOUR_PUBLIC_IP:~/
 
 # Replace YOUR_PUBLIC_IP with your actual IP
+# ⚠️ This upload may take a few minutes because model files are large (15-100 MB)
 ```
 
 **Then on EC2:**
@@ -681,6 +701,11 @@ scp -i ~/.ssh/autoscaling-backend-key.pem -r backend/ ubuntu@YOUR_PUBLIC_IP:~/
 ```bash
 # Navigate to uploaded files
 cd ~/backend
+
+# ⚠️ IMPORTANT: Verify all model files were uploaded
+ls -la *.pkl *.h5
+# You should see all the model files listed above
+# If any are missing, the backend won't work!
 ```
 
 ---
