@@ -1,6 +1,10 @@
 from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import Response
+
+# Prometheus metrics
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 import os
 import logging
 import warnings
@@ -61,6 +65,42 @@ app = FastAPI(title="AI Predictive Autoscaling System")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
+
+# --------------------- Prometheus metrics ---------------------
+# Counters and histograms for basic HTTP metrics and predictions
+HTTP_REQUESTS_TOTAL = Counter(
+    'http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'http_status']
+)
+HTTP_REQUEST_LATENCY_SECONDS = Histogram(
+    'http_request_latency_seconds', 'HTTP request latency in seconds', ['endpoint']
+)
+
+
+@app.middleware("http")
+async def prometheus_middleware(request, call_next):
+    """Middleware to track request counts and latency for Prometheus."""
+    path = request.url.path
+    method = request.method
+    with HTTP_REQUEST_LATENCY_SECONDS.labels(endpoint=path).time():
+        try:
+            response = await call_next(request)
+            status_code = getattr(response, 'status_code', 200)
+        except Exception as e:
+            # On exceptions, increment counter with 500
+            HTTP_REQUESTS_TOTAL.labels(method=method, endpoint=path, http_status='500').inc()
+            raise
+
+    HTTP_REQUESTS_TOTAL.labels(method=method, endpoint=path, http_status=str(status_code)).inc()
+    return response
+
+
+@app.get("/metrics")
+def metrics():
+    """Expose Prometheus metrics."""
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+# ------------------- end Prometheus metrics -------------------
 
 # Configure logging
 logging.basicConfig(
@@ -2012,7 +2052,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000').split(','),
+    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,http://ec2-15-207-98-239.ap-south-1.compute.amazonaws.com,http://15.207.98.239.com').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )

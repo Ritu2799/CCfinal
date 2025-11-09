@@ -1,6 +1,7 @@
 # ============================================================
-#  FASTAPI + ML BACKEND REQUIREMENTS  (Python 3.10.19)
-#  Works on macOS (M1/M2/M3) and Ubuntu (x86_64)
+#  FASTAPI + ML BACKEND REQUIREMENTS (Docker / Linux)
+#  Use this when building the Docker image (Linux x86_64)
+#  Python 3.10.x
 # ============================================================
 
 # --- Core Utilities ---
@@ -51,11 +52,8 @@ catboost==1.2.5
 lightgbm==4.3.0
 
 # --- TensorFlow ---
-# For macOS (Apple Silicon):
-tensorflow-macos==2.11.0
-tensorflow-metal==0.7.1  # optional, enables GPU via Apple Metal
-# For Ubuntu/Linux (x86_64):
-# tensorflow==2.10.1
+# Use a Linux-compatible TensorFlow for Docker builds (Ubuntu / x86_64)
+tensorflow==2.10.1
 
 # --- Backend & Auth ---
 python-dotenv==1.0.1
