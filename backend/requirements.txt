@@ -52,11 +52,10 @@ lightgbm==4.3.0
 
 # --- TensorFlow ---
 # For macOS (Apple Silicon):
-tensorflow-macos==2.11.0
-tensorflow-metal==0.7.1  # optional, enables GPU via Apple Metal
+# optional, enables GPU via Apple Metal
 # For Ubuntu/Linux (x86_64):
 # tensorflow==2.10.1
-
+tensorflow==2.10.1  
 # --- Backend & Auth ---
 python-dotenv==1.0.1
 passlib==1.7.4
